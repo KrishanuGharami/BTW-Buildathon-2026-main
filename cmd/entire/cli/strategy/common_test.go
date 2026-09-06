@@ -1,0 +1,1789 @@
+package strategy
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent"
+	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/cmd/entire/cli/vercelconfig"
+	"github.com/entireio/cli/redact"
+
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWorktreeRoot_Cache(t *testing.T) {
+	// Uses t.Chdir + t.Setenv so cannot be parallel.
+	tmpDir := t.TempDir()
+	initTestRepo(t, tmpDir)
+	t.Chdir(tmpDir)
+	paths.ClearWorktreeRootCache()
+
+	// First call populates the cache via git.
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) first call error: %v", err)
+	}
+
+	// Resolve symlinks for comparison (macOS /var -> /private/var).
+	want, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) = %q, want %q", got, want)
+	}
+
+	// Break git by pointing PATH at an empty directory.
+	// If the second call hits git it will fail.
+	emptyDir := t.TempDir()
+	t.Setenv("PATH", emptyDir)
+
+	got2, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) cached call should succeed, got error: %v", err)
+	}
+	if got2 != want {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) cached = %q, want %q", got2, want)
+	}
+
+	// After clearing the cache the broken PATH must cause a failure, even though
+	// this directory plainly is a repository and a walk up for .git would say so.
+	// Nothing here may substitute a guess for git's answer: the failure is what
+	// keeps entiredir's fallback to the current directory narrow, since that
+	// fallback fires only on ErrNotARepository, which this is not.
+	paths.ClearWorktreeRootCache()
+	_, err = paths.WorktreeRoot(context.Background())
+	if err == nil {
+		t.Fatal("paths.WorktreeRoot(context.Background()) should fail after cache clear with broken PATH")
+	}
+	if errors.Is(err, paths.ErrNotARepository) {
+		t.Fatalf("a git that could not be run was reported as no repository: %v", err)
+	}
+}
+
+func TestWorktreeRoot_MainRepo(t *testing.T) {
+	// In a normal (non-worktree) repo, WorktreeRoot returns the repo root.
+	// Uses t.Chdir so cannot be parallel.
+	tmpDir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	tmpDir = resolved
+
+	initTestRepo(t, tmpDir)
+	t.Chdir(tmpDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) error: %v", err)
+	}
+	if got != tmpDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) = %q, want repo root %q", got, tmpDir)
+	}
+
+	// Also works from a subdirectory.
+	subDir := filepath.Join(tmpDir, "sub", "dir")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	t.Chdir(subDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err = paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) from subdir error: %v", err)
+	}
+	if got != tmpDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from subdir = %q, want repo root %q", got, tmpDir)
+	}
+}
+
+func TestWorktreeRoot_Worktree(t *testing.T) {
+	// In a git worktree, WorktreeRoot must return the worktree's own root,
+	// NOT the main repository root. The worktree is placed in a separate
+	// temp directory (sibling, not child) so the two paths share no prefix.
+	// Uses t.Chdir so cannot be parallel.
+	mainDir := t.TempDir()
+	mainResolved, err := filepath.EvalSymlinks(mainDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	mainDir = mainResolved
+
+	initTestRepo(t, mainDir)
+
+	worktreeDir := t.TempDir()
+	wtResolved, err := filepath.EvalSymlinks(worktreeDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks error: %v", err)
+	}
+	worktreeDir = wtResolved
+
+	// t.TempDir() creates the directory; git worktree add needs it to not exist.
+	if err := os.Remove(worktreeDir); err != nil {
+		t.Fatalf("failed to remove temp dir for worktree: %v", err)
+	}
+	if err := createWorktree(mainDir, worktreeDir, "wt-branch"); err != nil {
+		t.Fatalf("failed to create worktree: %v", err)
+	}
+	t.Cleanup(func() { removeWorktree(mainDir, worktreeDir) })
+
+	t.Chdir(worktreeDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err := paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) error: %v", err)
+	}
+	if got != worktreeDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) = %q, want worktree root %q", got, worktreeDir)
+	}
+	if got == mainDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) returned main repo root %q, must return worktree root", mainDir)
+	}
+
+	// Also works from a subdirectory within the worktree.
+	subDir := filepath.Join(worktreeDir, "deep", "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+	t.Chdir(subDir)
+	paths.ClearWorktreeRootCache()
+
+	got, err = paths.WorktreeRoot(context.Background())
+	if err != nil {
+		t.Fatalf("paths.WorktreeRoot(context.Background()) from worktree subdir error: %v", err)
+	}
+	if got != worktreeDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from worktree subdir = %q, want %q", got, worktreeDir)
+	}
+	if got == mainDir {
+		t.Errorf("paths.WorktreeRoot(context.Background()) from worktree subdir returned main repo root %q", mainDir)
+	}
+}
+
+func TestGetCurrentBranchName(t *testing.T) {
+	t.Run("on branch", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		if _, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+		}); err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Should be on default branch (master or main)
+		branchName := GetCurrentBranchName(repo)
+		if branchName == "" {
+			t.Error("GetCurrentBranchName() returned empty string, expected branch name")
+		}
+
+		// Create and checkout a new branch
+		head, err := repo.Head()
+		if err != nil {
+			t.Fatalf("failed to get HEAD: %v", err)
+		}
+
+		newBranch := "feature/test-branch"
+		if err := wt.Checkout(&git.CheckoutOptions{
+			Branch: plumbing.NewBranchReferenceName(newBranch),
+			Create: true,
+			Hash:   head.Hash(),
+		}); err != nil {
+			t.Fatalf("failed to checkout branch: %v", err)
+		}
+
+		// Should return the new branch name
+		branchName = GetCurrentBranchName(repo)
+		if branchName != newBranch {
+			t.Errorf("GetCurrentBranchName() = %q, want %q", branchName, newBranch)
+		}
+	})
+
+	t.Run("detached HEAD", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Checkout the commit directly (detached HEAD)
+		if err := wt.Checkout(&git.CheckoutOptions{Hash: commitHash}); err != nil {
+			t.Fatalf("failed to checkout commit: %v", err)
+		}
+
+		// Should return empty string for detached HEAD
+		branchName := GetCurrentBranchName(repo)
+		if branchName != "" {
+			t.Errorf("GetCurrentBranchName() = %q, want empty string for detached HEAD", branchName)
+		}
+	})
+}
+
+// initTestRepo creates a git repo with an initial commit
+func initTestRepo(t *testing.T, dir string) {
+	t.Helper()
+	testutil.InitRepo(t, dir)
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+
+	testFile := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(testFile, []byte("# Test"), 0o600); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+
+	if _, err := wt.Add("README.md"); err != nil {
+		t.Fatalf("failed to add: %v", err)
+	}
+
+	if _, err := wt.Commit("Initial commit", &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+	}); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+}
+
+// createWorktree creates a git worktree using native git command
+func createWorktree(repoDir, worktreeDir, branch string) error {
+	cmd := exec.CommandContext(context.Background(), "git", "worktree", "add", worktreeDir, "-b", branch)
+	cmd.Dir = repoDir
+	return cmd.Run()
+}
+
+// removeWorktree removes a git worktree using native git command
+func removeWorktree(repoDir, worktreeDir string) {
+	cmd := exec.CommandContext(context.Background(), "git", "worktree", "remove", worktreeDir, "--force")
+	cmd.Dir = repoDir
+	_ = cmd.Run() //nolint:errcheck // Best effort cleanup, ignore errors
+}
+
+func TestGetDefaultBranchName(t *testing.T) {
+	t.Run("returns main when main branch exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit (go-git creates master by default)
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Create main branch
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName("main"), commitHash)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatalf("failed to create main branch: %v", err)
+		}
+
+		result := GetDefaultBranchName(repo)
+
+		if result != "main" {
+			t.Errorf("GetDefaultBranchName() = %q, want %q", result, "main")
+		}
+	})
+
+	t.Run("returns master when only master exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit (go-git creates master by default)
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		if _, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		}); err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		result := GetDefaultBranchName(repo)
+
+		if result != "master" {
+			t.Errorf("GetDefaultBranchName() = %q, want %q", result, "master")
+		}
+	})
+
+	t.Run("returns empty when no main or master", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Create a different branch and delete master
+		if err := wt.Checkout(&git.CheckoutOptions{
+			Hash:   commitHash,
+			Branch: plumbing.NewBranchReferenceName("develop"),
+			Create: true,
+		}); err != nil {
+			t.Fatalf("failed to create develop branch: %v", err)
+		}
+
+		// Delete master branch
+		if err := repo.Storer.RemoveReference(plumbing.NewBranchReferenceName("master")); err != nil {
+			t.Fatalf("failed to delete master branch: %v", err)
+		}
+
+		result := GetDefaultBranchName(repo)
+		if result != "" {
+			t.Errorf("GetDefaultBranchName() = %q, want empty string", result)
+		}
+	})
+
+	t.Run("returns origin/HEAD target when set", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Create trunk branch (simulate non-standard default branch)
+		trunkRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("trunk"), commitHash)
+		if err := repo.Storer.SetReference(trunkRef); err != nil {
+			t.Fatalf("failed to create trunk branch: %v", err)
+		}
+
+		// Create origin/trunk remote ref
+		originTrunkRef := plumbing.NewHashReference(plumbing.NewRemoteReferenceName("origin", "trunk"), commitHash)
+		if err := repo.Storer.SetReference(originTrunkRef); err != nil {
+			t.Fatalf("failed to create origin/trunk ref: %v", err)
+		}
+
+		// Set origin/HEAD to point to origin/trunk (symbolic ref)
+		originHeadRef := plumbing.NewSymbolicReference(plumbing.ReferenceName("refs/remotes/origin/HEAD"), plumbing.ReferenceName("refs/remotes/origin/trunk"))
+		if err := repo.Storer.SetReference(originHeadRef); err != nil {
+			t.Fatalf("failed to set origin/HEAD: %v", err)
+		}
+
+		// Delete master branch so it doesn't take precedence
+		_ = repo.Storer.RemoveReference(plumbing.NewBranchReferenceName("master")) //nolint:errcheck // best-effort cleanup for test
+
+		result := GetDefaultBranchName(repo)
+
+		if result != "trunk" {
+			t.Errorf("GetDefaultBranchName() = %q, want %q", result, "trunk")
+		}
+	})
+}
+
+func TestIsOnDefaultBranch(t *testing.T) {
+	t.Run("returns true when on main", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Create and checkout main branch
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName("main"), commitHash)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatalf("failed to create main branch: %v", err)
+		}
+		if err := wt.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("main")}); err != nil {
+			t.Fatalf("failed to checkout main: %v", err)
+		}
+
+		isDefault, branchName := IsOnDefaultBranch(repo)
+		if !isDefault {
+			t.Error("IsOnDefaultBranch() = false, want true when on main")
+		}
+		if branchName != "main" {
+			t.Errorf("branchName = %q, want %q", branchName, "main")
+		}
+	})
+
+	t.Run("returns true when on master", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit (go-git creates master by default)
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		if _, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		}); err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		isDefault, branchName := IsOnDefaultBranch(repo)
+		if !isDefault {
+			t.Error("IsOnDefaultBranch() = false, want true when on master")
+		}
+		if branchName != "master" {
+			t.Errorf("branchName = %q, want %q", branchName, "master")
+		}
+	})
+
+	t.Run("returns false when on feature branch", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Create and checkout feature branch
+		if err := wt.Checkout(&git.CheckoutOptions{
+			Hash:   commitHash,
+			Branch: plumbing.NewBranchReferenceName("feature/test"),
+			Create: true,
+		}); err != nil {
+			t.Fatalf("failed to create feature branch: %v", err)
+		}
+
+		isDefault, branchName := IsOnDefaultBranch(repo)
+		if isDefault {
+			t.Error("IsOnDefaultBranch() = true, want false when on feature branch")
+		}
+		if branchName != "feature/test" {
+			t.Errorf("branchName = %q, want %q", branchName, "feature/test")
+		}
+	})
+
+	t.Run("returns false for detached HEAD", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		repo, err := git.PlainOpen(tmpDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create initial commit
+		testFile := filepath.Join(tmpDir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("test"), 0o644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+
+		commitHash, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@example.com"},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Checkout to detached HEAD state
+		if err := wt.Checkout(&git.CheckoutOptions{Hash: commitHash}); err != nil {
+			t.Fatalf("failed to checkout detached HEAD: %v", err)
+		}
+
+		isDefault, branchName := IsOnDefaultBranch(repo)
+		if isDefault {
+			t.Error("IsOnDefaultBranch() = true, want false for detached HEAD")
+		}
+		if branchName != "" {
+			t.Errorf("branchName = %q, want empty string for detached HEAD", branchName)
+		}
+	})
+}
+
+func TestGetGitAuthorFromRepo(t *testing.T) {
+	// Cannot use t.Parallel() because subtests use t.Setenv to isolate global git config.
+
+	tests := []struct {
+		name        string
+		localName   string
+		localEmail  string
+		globalName  string
+		globalEmail string
+		wantName    string
+		wantEmail   string
+	}{
+		{
+			name:       "both set locally",
+			localName:  "Local User",
+			localEmail: "local@example.com",
+			wantName:   "Local User",
+			wantEmail:  "local@example.com",
+		},
+		{
+			name:        "only name set locally falls back to global for email",
+			localName:   "Local User",
+			globalEmail: "global@example.com",
+			wantName:    "Local User",
+			wantEmail:   "global@example.com",
+		},
+		{
+			name:       "only email set locally falls back to global for name",
+			localEmail: "local@example.com",
+			globalName: "Global User",
+			wantName:   "Global User",
+			wantEmail:  "local@example.com",
+		},
+		{
+			name:        "nothing set locally falls back to global for both",
+			globalName:  "Global User",
+			globalEmail: "global@example.com",
+			wantName:    "Global User",
+			wantEmail:   "global@example.com",
+		},
+		{
+			name:      "nothing set anywhere returns defaults",
+			wantName:  "Unknown",
+			wantEmail: "unknown@local",
+		},
+		{
+			name:        "local takes precedence over global",
+			localName:   "Local User",
+			localEmail:  "local@example.com",
+			globalName:  "Global User",
+			globalEmail: "global@example.com",
+			wantName:    "Local User",
+			wantEmail:   "local@example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useAutoConfigLoader(t)
+
+			// Isolate global git config by pointing HOME to a temp dir
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", "")
+
+			// Write global .gitconfig if needed
+			if tt.globalName != "" || tt.globalEmail != "" {
+				globalCfg := "[user]\n"
+				if tt.globalName != "" {
+					globalCfg += "\tname = " + tt.globalName + "\n"
+				}
+				if tt.globalEmail != "" {
+					globalCfg += "\temail = " + tt.globalEmail + "\n"
+				}
+				if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(globalCfg), 0o644); err != nil {
+					t.Fatalf("failed to write global gitconfig: %v", err)
+				}
+			}
+
+			// Create a repo for config resolution
+			dir := t.TempDir()
+			repo, err := git.PlainInit(dir, false)
+			if err != nil {
+				t.Fatalf("failed to init repo: %v", err)
+			}
+
+			// Set local config if needed
+			if tt.localName != "" || tt.localEmail != "" {
+				cfg, err := repo.Config()
+				if err != nil {
+					t.Fatalf("failed to get repo config: %v", err)
+				}
+				cfg.User.Name = tt.localName
+				cfg.User.Email = tt.localEmail
+				if err := repo.SetConfig(cfg); err != nil {
+					t.Fatalf("failed to set repo config: %v", err)
+				}
+			}
+
+			gotName, gotEmail := GetGitAuthorFromRepo(repo)
+			if gotName != tt.wantName {
+				t.Errorf("name = %q, want %q", gotName, tt.wantName)
+			}
+			if gotEmail != tt.wantEmail {
+				t.Errorf("email = %q, want %q", gotEmail, tt.wantEmail)
+			}
+		})
+	}
+}
+
+func TestIsProtectedPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		path      string
+		protected bool
+	}{
+		{".git", true},
+		{".git/objects", true},
+		{".entire", true},
+		{".entire/metadata/session.json", true},
+		{".claude", true},
+		{".claude/settings.json", true},
+		{".gemini", true},
+		{".gemini/settings.json", true},
+		{"src/main.go", false},
+		{"README.md", false},
+		{".gitignore", false},
+		{".github/workflows/ci.yml", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			if got := isProtectedPath(tt.path); got != tt.protected {
+				t.Errorf("isProtectedPath(%q) = %v, want %v", tt.path, got, tt.protected)
+			}
+		})
+	}
+}
+
+// initBareWithMetadataBranch creates a bare repo with a main branch and an
+// entire/checkpoints/v1 branch containing checkpoint data via git CLI.
+func initBareWithMetadataBranch(t *testing.T) string {
+	t.Helper()
+	bareDir := t.TempDir()
+
+	// Init bare, create main branch with a commit
+	workDir := t.TempDir()
+	run := func(dir string, args ...string) {
+		testutil.RunGit(t, dir, args...)
+	}
+	run(bareDir, "init", "--bare", "-b", "main")
+	run(workDir, "clone", bareDir, ".")
+	run(workDir, "config", "user.email", "test@test.com")
+	run(workDir, "config", "user.name", "Test User")
+	run(workDir, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test"), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run(workDir, "add", ".")
+	run(workDir, "commit", "-m", "init")
+	run(workDir, "push", "origin", "main")
+
+	// Create orphan entire/checkpoints/v1 with data
+	run(workDir, "checkout", "--orphan", paths.MetadataBranchName)
+	run(workDir, "rm", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(workDir, "metadata.json"), []byte(`{"checkpoint_id":"test123"}`), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run(workDir, "add", ".")
+	run(workDir, "commit", "-m", "Checkpoint: test123")
+	run(workDir, "push", "origin", paths.MetadataBranchName)
+
+	return bareDir
+}
+
+func TestEnsurePrimaryRef(t *testing.T) {
+	t.Parallel()
+
+	t.Run("creates from remote on fresh clone", func(t *testing.T) {
+		bareDir := initBareWithMetadataBranch(t)
+		cloneDir := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("clone failed: %v\n%s", err, out)
+		}
+
+		repo, err := git.PlainOpen(cloneDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+			t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+		}
+
+		// Local branch should exist with data (not empty)
+		ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+		if err != nil {
+			t.Fatalf("local branch not found: %v", err)
+		}
+		commit, err := repo.CommitObject(ref.Hash())
+		if err != nil {
+			t.Fatalf("failed to get commit: %v", err)
+		}
+		tree, err := commit.Tree()
+		if err != nil {
+			t.Fatalf("failed to get tree: %v", err)
+		}
+		if len(tree.Entries) == 0 {
+			t.Error("local branch has empty tree — remote data was not preserved")
+		}
+	})
+
+	t.Run("updates empty orphan from remote", func(t *testing.T) {
+		t.Parallel()
+		bareDir := initBareWithMetadataBranch(t)
+		cloneDir := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("clone failed: %v\n%s", err, out)
+		}
+
+		repo, err := git.PlainOpen(cloneDir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create an empty orphan locally (simulates old enable behavior)
+		emptyTree := &object.Tree{Entries: []object.TreeEntry{}}
+		treeObj := repo.Storer.NewEncodedObject()
+		if err := emptyTree.Encode(treeObj); err != nil {
+			t.Fatalf("failed to encode tree: %v", err)
+		}
+		treeHash, err := repo.Storer.SetEncodedObject(treeObj)
+		if err != nil {
+			t.Fatalf("failed to store tree: %v", err)
+		}
+		orphan := &object.Commit{
+			TreeHash: treeHash,
+			Author:   object.Signature{Name: "Test", Email: "test@test.com"},
+			Message:  "Initialize metadata branch\n",
+		}
+		orphanObj := repo.Storer.NewEncodedObject()
+		if err := orphan.Encode(orphanObj); err != nil {
+			t.Fatalf("failed to encode commit: %v", err)
+		}
+		orphanHash, err := repo.Storer.SetEncodedObject(orphanObj)
+		if err != nil {
+			t.Fatalf("failed to store commit: %v", err)
+		}
+		refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+		if err := repo.Storer.SetReference(plumbing.NewHashReference(refName, orphanHash)); err != nil {
+			t.Fatalf("failed to set ref: %v", err)
+		}
+
+		if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+			t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+		}
+
+		// Should have been updated from remote — no longer empty
+		ref, err := repo.Reference(refName, true)
+		if err != nil {
+			t.Fatalf("local branch not found: %v", err)
+		}
+		if ref.Hash() == orphanHash {
+			t.Error("local branch still points to empty orphan — was not updated from remote")
+		}
+	})
+
+	t.Run("creates empty orphan when no remote", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		initTestRepo(t, dir)
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+		if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+			t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+		}
+
+		ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+		if err != nil {
+			t.Fatalf("branch not found: %v", err)
+		}
+		commit, err := repo.CommitObject(ref.Hash())
+		if err != nil {
+			t.Fatalf("failed to get commit: %v", err)
+		}
+		tree, err := commit.Tree()
+		if err != nil {
+			t.Fatalf("failed to get tree: %v", err)
+		}
+		if len(tree.Entries) != 0 {
+			t.Errorf("expected empty tree, got %d entries", len(tree.Entries))
+		}
+	})
+
+	t.Run("skips empty orphan when primary is git-refs", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		initTestRepo(t, dir)
+
+		// Select the git-refs backend for this repo. EnsurePrimaryRef rebinds
+		// the config lookup to the repo root, so a repo-local settings file is
+		// what it reads.
+		settingsDir := filepath.Join(dir, ".entire")
+		if err := os.MkdirAll(settingsDir, 0o750); err != nil {
+			t.Fatalf("failed to create .entire dir: %v", err)
+		}
+		cfg := []byte(`{"checkpoints":{"primary":{"type":"git-refs"}}}`)
+		if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"), cfg, 0o600); err != nil {
+			t.Fatalf("failed to write settings: %v", err)
+		}
+
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+		if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+			t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+		}
+
+		// Under git-refs, checkpoints live in per-checkpoint refs and nothing
+		// is ever written to v1, so no vestigial empty orphan should be created.
+		_, err = repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+		require.ErrorIs(t, err, plumbing.ErrReferenceNotFound,
+			"expected no v1 branch under git-refs primary")
+	})
+}
+
+func TestEnsurePrimaryRef_WritesVercelConfigWhenEnabled(t *testing.T) {
+	vercelconfig.ResetSettingsCache()
+	t.Cleanup(vercelconfig.ResetSettingsCache)
+
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".entire"), 0o755); err != nil {
+		t.Fatalf("mkdir .entire: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".entire", "settings.json"), []byte(`{"enabled":true,"vercel":true}`), 0o644); err != nil {
+		t.Fatalf("write settings.json: %v", err)
+	}
+
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+	t.Chdir(dir)
+	if err := vercelconfig.InitSettings(context.Background()); err != nil {
+		t.Fatalf("InitSettings() failed: %v", err)
+	}
+
+	if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+		t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+	}
+
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	if err != nil {
+		t.Fatalf("branch not found: %v", err)
+	}
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("failed to get commit: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("failed to get tree: %v", err)
+	}
+	file, err := tree.File(vercelconfig.FileName)
+	if err != nil {
+		t.Fatalf("expected %s on metadata branch: %v", vercelconfig.FileName, err)
+	}
+	content, err := file.Contents()
+	if err != nil {
+		t.Fatalf("read %s: %v", vercelconfig.FileName, err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal([]byte(content), &config); err != nil {
+		t.Fatalf("parse %s: %v", vercelconfig.FileName, err)
+	}
+	if !vercelconfig.DeploymentDisabled(config) {
+		t.Fatalf("expected %s to disable %s, got %s", vercelconfig.FileName, vercelconfig.BranchPattern, content)
+	}
+}
+
+// Not parallel: uses t.Chdir.
+func TestEnsurePrimaryRef_SeedsV1FromRemote(t *testing.T) {
+	bareDir := initBareWithMetadataBranch(t)
+	cloneDir, _ := cloneWithConfig(t, bareDir)
+
+	t.Chdir(cloneDir)
+	paths.ClearWorktreeRootCache()
+
+	repo, err := git.PlainOpen(cloneDir)
+	require.NoError(t, err)
+
+	require.NoError(t, EnsurePrimaryRef(t.Context(), repo))
+
+	_, err = repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	require.NoError(t, err, "local v1 branch should be seeded from origin")
+}
+
+// cloneWithConfig clones bareDir into a new temp directory, configures git identity,
+// and returns the clone path and a git runner function.
+func cloneWithConfig(t *testing.T, bareDir string) (string, func(args ...string)) {
+	t.Helper()
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	// GitIsolatedEnv on every invocation, matching initBareWithMetadataBranch:
+	// without it these commands inherit the developer's or CI's global git
+	// config, and a global gc.autoDetach=true lets a background `git gc` write
+	// .git/objects after the test returns and race t.TempDir() cleanup. Per-command
+	// env rather than t.Setenv, so callers can still use t.Parallel().
+	cmd := exec.CommandContext(context.Background(), "git", "clone", bareDir, cloneDir)
+	cmd.Env = testutil.GitIsolatedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone failed: %v\n%s", err, out)
+	}
+	run := func(args ...string) {
+		testutil.RunGit(t, cloneDir, args...)
+	}
+	run("config", "user.email", "test@test.com")
+	run("config", "user.name", "Test User")
+	run("config", "commit.gpgsign", "false")
+	return cloneDir, run
+}
+
+func TestEnsurePrimaryRef_DisconnectedBranchesNotReconciledInEnable(t *testing.T) {
+	t.Parallel()
+
+	bareDir := initBareWithMetadataBranch(t)
+	cloneDir, run := cloneWithConfig(t, bareDir)
+
+	// Create a disconnected local branch with different checkpoint data
+	run("checkout", "--orphan", "temp-orphan")
+	run("rm", "-rf", ".")
+	localCheckpointDir := filepath.Join(cloneDir, "ab", "cdef012345")
+	if err := os.MkdirAll(localCheckpointDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(localCheckpointDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"abcdef012345"}`), 0o644,
+	); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run("add", ".")
+	run("commit", "-m", "Checkpoint: abcdef012345")
+	run("branch", "-f", paths.MetadataBranchName, "temp-orphan")
+
+	repo, err := git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+
+	// Get local ref hash before EnsurePrimaryRef
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	localRefBefore, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+
+	if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+		t.Fatalf("EnsurePrimaryRef() failed: %v", err)
+	}
+
+	// EnsurePrimaryRef should NOT reconcile disconnected branches.
+	// Reconciliation happens at pre-push time or via 'entire doctor'.
+	// The local branch should be unchanged.
+	localRefAfter, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+	if localRefAfter.Hash() != localRefBefore.Hash() {
+		t.Error("EnsurePrimaryRef should not modify disconnected local branch with real data")
+	}
+}
+
+func TestEnsurePrimaryRef_DoesNotFastForwardWhenBehind(t *testing.T) {
+	t.Parallel()
+
+	bareDir := initBareWithMetadataBranch(t)
+	cloneDir, run := cloneWithConfig(t, bareDir)
+
+	// Create local branch from remote (normal state)
+	repo, err := git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+	if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+		t.Fatalf("first EnsurePrimaryRef() failed: %v", err)
+	}
+
+	// Remember current local hash
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	localBefore, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+
+	// Add a second checkpoint to the remote (simulates another machine pushing)
+	run("checkout", paths.MetadataBranchName)
+	secondDir := filepath.Join(cloneDir, "cd", "ef01234567")
+	if err := os.MkdirAll(secondDir, 0o755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(secondDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"cdef01234567"}`), 0o644,
+	); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	run("add", ".")
+	run("commit", "-m", "Checkpoint: cdef01234567")
+	run("push", "origin", paths.MetadataBranchName)
+
+	// Reset local branch back to the old commit (local is now behind remote)
+	if err := repo.Storer.SetReference(
+		plumbing.NewHashReference(refName, localBefore.Hash()),
+	); err != nil {
+		t.Fatalf("failed to reset ref: %v", err)
+	}
+
+	// Re-open to clear caches
+	repo, err = git.PlainOpen(cloneDir)
+	if err != nil {
+		t.Fatalf("failed to reopen repo: %v", err)
+	}
+
+	if err := EnsurePrimaryRef(t.Context(), repo); err != nil {
+		t.Fatalf("second EnsurePrimaryRef() failed: %v", err)
+	}
+
+	// EnsurePrimaryRef no longer fast-forwards diverged branches (handled by push path).
+	// Local should be unchanged since it has real data and shares ancestry with remote.
+	localAfter, err := repo.Reference(refName, true)
+	if err != nil {
+		t.Fatalf("local branch not found: %v", err)
+	}
+	if localAfter.Hash() != localBefore.Hash() {
+		t.Error("EnsurePrimaryRef should not modify local branch with shared ancestry")
+	}
+}
+
+func TestSafelyAdvanceLocalRef_DoesNotAdvanceOnRefReadError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	repo, err := git.PlainOpen(dir)
+	require.NoError(t, err)
+	head, err := repo.Head()
+	require.NoError(t, err)
+
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	refPath := filepath.Join(dir, ".git", "refs", "heads", "entire", "checkpoints", "v1")
+	packedRefsPath := filepath.Join(dir, ".git", "packed-refs")
+	require.NoError(t, os.WriteFile(packedRefsPath, []byte("malformed packed refs\n"), 0o644))
+
+	repo, err = git.PlainOpen(dir)
+	require.NoError(t, err)
+
+	err = SafelyAdvanceLocalRef(context.Background(), repo, refName, head.Hash())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to read local ref")
+
+	_, err = os.Stat(refPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestSafelyAdvanceLocalRef_DoesNotReplayDisconnectedChainWhenTargetIsShallow(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	bareDir := t.TempDir()
+	setupDir := t.TempDir()
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	require.NoError(t, os.MkdirAll(cloneDir, 0o755))
+
+	run := func(dir string, args ...string) {
+		t.Helper()
+		testutil.RunGit(t, dir, args...)
+	}
+
+	run(bareDir, "init", "--bare", "-b", "main")
+	run(setupDir, "clone", bareDir, ".")
+	run(setupDir, "config", "user.email", "test@test.com")
+	run(setupDir, "config", "user.name", "Test User")
+	run(setupDir, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(setupDir, "README.md"), []byte("# Test"), 0o644))
+	run(setupDir, "add", ".")
+	run(setupDir, "commit", "-m", "init")
+	run(setupDir, "push", "origin", "main")
+
+	run(setupDir, "checkout", "--orphan", paths.MetadataBranchName)
+	run(setupDir, "rm", "-rf", ".")
+	localOnlyDir := filepath.Join(setupDir, "aa", "aaaaaaaaaa")
+	require.NoError(t, os.MkdirAll(localOnlyDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(localOnlyDir, "metadata.json"), []byte(`{"checkpoint_id":"aaaaaaaaaaaa"}`), 0o644))
+	run(setupDir, "add", ".")
+	run(setupDir, "commit", "-m", "Checkpoint: aaaaaaaaaaaa")
+	run(setupDir, "push", "origin", paths.MetadataBranchName)
+
+	run(cloneDir, "clone", bareDir, ".")
+	run(cloneDir, "config", "user.email", "test@test.com")
+	run(cloneDir, "config", "user.name", "Test User")
+	run(cloneDir, "config", "commit.gpgsign", "false")
+	run(cloneDir, "branch", paths.MetadataBranchName, "origin/"+paths.MetadataBranchName)
+
+	run(setupDir, "rm", "-rf", "aa")
+	remoteOnlyDir := filepath.Join(setupDir, "bb", "bbbbbbbbbb")
+	require.NoError(t, os.MkdirAll(remoteOnlyDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(remoteOnlyDir, "metadata.json"), []byte(`{"checkpoint_id":"bbbbbbbbbbbb"}`), 0o644))
+	run(setupDir, "add", ".")
+	run(setupDir, "commit", "-m", "Checkpoint: bbbbbbbbbbbb")
+	run(setupDir, "push", "origin", paths.MetadataBranchName)
+
+	run(cloneDir, "fetch", "--depth=1", "origin", "+refs/heads/"+paths.MetadataBranchName+":refs/remotes/origin/"+paths.MetadataBranchName)
+
+	repo, err := git.PlainOpen(cloneDir)
+	require.NoError(t, err)
+	localRefName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	localBefore, err := repo.Reference(localRefName, true)
+	require.NoError(t, err)
+	targetRef, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", paths.MetadataBranchName), true)
+	require.NoError(t, err)
+
+	_, mergeBaseErr := getMergeBase(ctx, cloneDir, localBefore.Hash().String(), targetRef.Hash().String())
+	require.ErrorIs(t, mergeBaseErr, errNoMergeBase)
+
+	err = SafelyAdvanceLocalRef(ctx, repo, localRefName, targetRef.Hash())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reachable shallow history")
+	assert.Contains(t, err.Error(), "entire doctor")
+	assert.Contains(t, err.Error(), "git fetch --unshallow")
+
+	localAfter, err := repo.Reference(localRefName, true)
+	require.NoError(t, err)
+	assert.Equal(t, localBefore.Hash(), localAfter.Hash())
+}
+
+// buildCommittedTree creates a git tree with the sharded committed checkpoint layout
+// used by entire/checkpoints/v1. files is a map of path -> content relative to the tree root.
+// Example: {"a3/b2c4d5e6f7/0/prompt.txt": "Hello"} creates the nested directory structure.
+func buildCommittedTree(t *testing.T, files map[string]string) *object.Tree {
+	t.Helper()
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		t.Fatalf("failed to open repo: %v", err)
+	}
+
+	for path, content := range files {
+		absPath := filepath.Join(dir, path)
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+			t.Fatalf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("failed to write %s: %v", path, err)
+		}
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	if _, err := wt.Add("."); err != nil {
+		t.Fatalf("failed to add files: %v", err)
+	}
+	commitHash, err := wt.Commit("test tree", &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+	})
+	if err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	commit, err := repo.CommitObject(commitHash)
+	if err != nil {
+		t.Fatalf("failed to get commit: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("failed to get tree: %v", err)
+	}
+	return tree
+}
+
+func TestReadLatestSessionPromptFromCommittedTree(t *testing.T) {
+	t.Parallel()
+
+	// Checkpoint ID "a3b2c4d5e6f7" -> path "a3/b2c4d5e6f7"
+	cpID := id.MustCheckpointID("a3b2c4d5e6f7")
+
+	t.Run("single session reads from 0/prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Implement login feature",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "Implement login feature" {
+			t.Errorf("got %q, want %q", got, "Implement login feature")
+		}
+	})
+
+	t.Run("multi session reads from latest session", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "First session prompt",
+			"a3/b2c4d5e6f7/1/prompt.txt": "Second session prompt",
+			"a3/b2c4d5e6f7/2/prompt.txt": "Third session prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Third session prompt" {
+			t.Errorf("got %q, want %q", got, "Third session prompt")
+		}
+	})
+
+	t.Run("falls back to session 0 when computed index missing", func(t *testing.T) {
+		t.Parallel()
+		// Tree only has session 0, but sessionCount says 3
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Fallback prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Fallback prompt" {
+			t.Errorf("got %q, want %q", got, "Fallback prompt")
+		}
+	})
+
+	t.Run("returns empty for missing prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		// Session directory exists but no prompt.txt
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/metadata.json": `{"session_id":"test"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("returns empty for missing checkpoint path", func(t *testing.T) {
+		t.Parallel()
+		// Tree has a different checkpoint ID
+		tree := buildCommittedTree(t, map[string]string{
+			"ff/aabbccddee/0/prompt.txt": "Wrong checkpoint",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("returns empty for zero session count", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Some prompt",
+		})
+
+		// sessionCount=0 triggers latestIndex=max(0-1,0)=0, should still read session 0
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 0)
+		if got != "Some prompt" {
+			t.Errorf("got %q, want %q", got, "Some prompt")
+		}
+	})
+
+	t.Run("falls back to earlier session when latest has no prompt", func(t *testing.T) {
+		t.Parallel()
+		// Session 1 (latest) has no prompt.txt, session 0 does.
+		// This happens when a test session gets condensed alongside a real one.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt":    "Real session prompt",
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"test"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "Real session prompt" {
+			t.Errorf("got %q, want %q", got, "Real session prompt")
+		}
+	})
+
+	t.Run("falls back through multiple empty sessions to find prompt", func(t *testing.T) {
+		t.Parallel()
+		// Sessions 2 and 1 have no prompt, session 0 does.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt":    "Original prompt",
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"s1"}`,
+			"a3/b2c4d5e6f7/2/metadata.json": `{"session_id":"s2"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 3)
+		if got != "Original prompt" {
+			t.Errorf("got %q, want %q", got, "Original prompt")
+		}
+	})
+
+	t.Run("returns empty when no session has a prompt", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/metadata.json": `{"session_id":"s0"}`,
+			"a3/b2c4d5e6f7/1/metadata.json": `{"session_id":"s1"}`,
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "" {
+			t.Errorf("got %q, want empty string", got)
+		}
+	})
+
+	t.Run("falls back when latest has empty prompt.txt", func(t *testing.T) {
+		t.Parallel()
+		// Latest session has a prompt.txt file but it's empty — should fall back.
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "Real prompt",
+			"a3/b2c4d5e6f7/1/prompt.txt": "",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 2)
+		if got != "Real prompt" {
+			t.Errorf("got %q, want %q", got, "Real prompt")
+		}
+	})
+
+	t.Run("extracts first prompt from multi-prompt content", func(t *testing.T) {
+		t.Parallel()
+		tree := buildCommittedTree(t, map[string]string{
+			"a3/b2c4d5e6f7/0/prompt.txt": "First prompt\n\n---\n\nSecond prompt",
+		})
+
+		got := ReadLatestSessionPromptFromCommittedTree(tree, cpID, 1)
+		if got != "First prompt" {
+			t.Errorf("got %q, want %q", got, "First prompt")
+		}
+	})
+}
+
+func TestReadAllSessionPromptsFromTree(t *testing.T) {
+	t.Parallel()
+
+	tree := buildCommittedTree(t, map[string]string{
+		"a3/b2c4d5e6f7/0/prompt.txt": "First session prompt",
+		"a3/b2c4d5e6f7/1/prompt.txt": "Second session prompt",
+	})
+
+	got := ReadAllSessionPromptsFromTree(tree, "a3/b2c4d5e6f7", 2, []string{"session-1", "session-2"})
+	assert.Equal(t, []string{"First session prompt", "Second session prompt"}, got)
+}
+
+func TestIsEmptyRepository(t *testing.T) {
+	t.Parallel()
+	t.Run("empty repo returns true", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		testutil.InitRepo(t, dir)
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+		if !IsEmptyRepository(repo) {
+			t.Error("IsEmptyRepository() = false, want true for empty repo")
+		}
+	})
+
+	t.Run("repo with commit returns false", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		testutil.InitRepo(t, dir)
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			t.Fatalf("failed to open repo: %v", err)
+		}
+
+		// Create a commit
+		testFile := filepath.Join(dir, "test.txt")
+		if err := os.WriteFile(testFile, []byte("content"), 0o644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+		wt, err := repo.Worktree()
+		if err != nil {
+			t.Fatalf("failed to get worktree: %v", err)
+		}
+		if _, err := wt.Add("test.txt"); err != nil {
+			t.Fatalf("failed to add file: %v", err)
+		}
+		if _, err := wt.Commit("Initial commit", &git.CommitOptions{
+			Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+		}); err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		if IsEmptyRepository(repo) {
+			t.Error("IsEmptyRepository() = true, want false for repo with commit")
+		}
+	})
+}
+
+// openRepoHeadTree opens the repo at dir and returns the HEAD commit tree.
+func openRepoHeadTree(t *testing.T, dir string) *object.Tree {
+	t.Helper()
+	repo, err := git.PlainOpen(dir)
+	require.NoError(t, err)
+	head, err := repo.Head()
+	require.NoError(t, err)
+	commit, err := repo.CommitObject(head.Hash())
+	require.NoError(t, err)
+	tree, err := commit.Tree()
+	require.NoError(t, err)
+	return tree
+}
+
+func TestReadAgentTypeFromTree(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		files []string // committed before resolution
+		want  types.AgentType
+	}{
+		{"only claude", []string{".claude/settings.json"}, agent.AgentTypeClaudeCode},
+		{"only gemini", []string{".gemini/settings.json"}, agent.AgentTypeGemini},
+		{"only codex", []string{".codex/config.json"}, agent.AgentTypeCodex},
+		{"only cursor", []string{".cursor/settings.json"}, agent.AgentTypeCursor},
+		{"only factory", []string{".factory/settings.json"}, agent.AgentTypeFactoryAIDroid},
+		{"claude and codex is ambiguous", []string{".claude/settings.json", ".codex/config.json"}, agent.AgentTypeUnknown},
+		{"claude and gemini is ambiguous", []string{".claude/settings.json", ".gemini/settings.json"}, agent.AgentTypeUnknown},
+		{"no agent dirs", []string{"f.txt"}, agent.AgentTypeUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			testutil.InitRepo(t, dir)
+			for _, f := range tt.files {
+				testutil.WriteFile(t, dir, f, `{}`)
+				testutil.GitAdd(t, dir, f)
+			}
+			testutil.GitCommit(t, dir, "init")
+
+			tree := openRepoHeadTree(t, dir)
+			result := ReadAgentTypeFromTree(tree, "nonexistent-path")
+			assert.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestReadAgentTypeFromTree_MetadataJSON_OverridesDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, ".claude/settings.json", `{}`)
+	testutil.GitAdd(t, dir, ".claude/settings.json")
+	testutil.WriteFile(t, dir, "cp/metadata.json", `{"agent":"Cursor"}`)
+	testutil.GitAdd(t, dir, "cp/metadata.json")
+	testutil.GitCommit(t, dir, "init")
+
+	tree := openRepoHeadTree(t, dir)
+	result := ReadAgentTypeFromTree(tree, "cp")
+	assert.Equal(t, agent.AgentTypeCursor, result)
+}
+
+func TestEnsureEntireGitignore_IncludesRedactorsLocal(t *testing.T) {
+	// Cannot t.Parallel(): EnsureEntireGitignore writes to the worktree root.
+
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+
+	if err := EnsureEntireGitignore(context.Background()); err != nil {
+		t.Fatalf("EnsureEntireGitignore: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, ".entire", ".gitignore"))
+	if err != nil {
+		t.Fatalf("read .entire/.gitignore: %v", err)
+	}
+	if !strings.Contains(string(body), "redactors/local/") {
+		t.Errorf(".entire/.gitignore missing redactors/local/ entry; got:\n%s", body)
+	}
+}
+
+// writeSettingsJSON creates .entire/settings.json in dir with the given body.
+func writeSettingsJSON(t *testing.T, dir, body string) {
+	t.Helper()
+	entireDir := filepath.Join(dir, paths.EntireDir)
+	if err := os.MkdirAll(entireDir, 0o755); err != nil {
+		t.Fatalf("mkdir .entire: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(entireDir, "settings.json"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write settings.json: %v", err)
+	}
+}
+
+func TestEnsureRedactionConfigured_ScannerError(t *testing.T) {
+	// Cannot t.Parallel(): uses t.Chdir and resets a package-level sync.Once.
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	writeSettingsJSON(t, tmp, `{"enabled":true,"strategy":"manual-commit","redaction":{"betterleaks":{"enabled":false}}}`)
+	t.Chdir(tmp)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+	resetRedactionConfiguredForTest()
+	t.Cleanup(resetRedactionConfiguredForTest)
+
+	err := EnsureRedactionConfigured(t.Context())
+	if err == nil || !errors.Is(err, settings.ErrScannerConfig) {
+		t.Fatalf("EnsureRedactionConfigured() = %v, want ErrScannerConfig", err)
+	}
+	if err := EnsureRedactionConfigured(t.Context()); err == nil {
+		t.Fatal("second call returned nil; scanner error must be sticky across the Once")
+	}
+}
+
+func TestEnsureRedactionConfigured_GoredactEnabled(t *testing.T) {
+	// Cannot t.Parallel(): uses t.Chdir and resets a package-level sync.Once.
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	writeSettingsJSON(t, tmp, `{"enabled":true,"strategy":"manual-commit","redaction":{"goredact":{"enabled":true}}}`)
+	t.Chdir(tmp)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+	resetRedactionConfiguredForTest()
+	t.Cleanup(resetRedactionConfiguredForTest)
+	t.Cleanup(func() {
+		if err := redact.ConfigureScanners(redact.ScannersConfig{Betterleaks: true}); err != nil {
+			t.Errorf("restore default scanners: %v", err)
+		}
+	})
+
+	if err := EnsureRedactionConfigured(t.Context()); err != nil {
+		t.Fatalf("EnsureRedactionConfigured() = %v, want nil", err)
+	}
+}
+
+func TestEnsureRedactionConfigured_NarrowedScanners(t *testing.T) {
+	// Cannot t.Parallel(): uses t.Chdir and resets a package-level sync.Once.
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	writeSettingsJSON(t, tmp, `{"enabled":true,"strategy":"manual-commit","redaction":{"betterleaks":{"enabled":false},"goredact":{"enabled":true}}}`)
+	t.Chdir(tmp)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+	resetRedactionConfiguredForTest()
+	t.Cleanup(resetRedactionConfiguredForTest)
+	t.Cleanup(func() {
+		if err := redact.ConfigureScanners(redact.ScannersConfig{Betterleaks: true}); err != nil {
+			t.Errorf("restore default scanners: %v", err)
+		}
+	})
+
+	if err := EnsureRedactionConfigured(t.Context()); err != nil {
+		t.Fatalf("EnsureRedactionConfigured() = %v, want nil (betterleaks-off + goredact-on is legal)", err)
+	}
+	// With betterleaks disabled, redacting this low-entropy PAT (invisible to
+	// every non-scanner layer) is attributable to goredact alone.
+	const pat = "ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2"
+	if got := redact.String("auth with token " + pat); strings.Contains(got, pat) {
+		t.Fatalf("PAT survived goredact-only redaction: %q", got)
+	}
+
+	marker := filepath.Join(tmp, ".entire", "tmp", "scanner-notice")
+	info, err := os.Stat(marker)
+	if err != nil {
+		t.Fatalf("narrowed-coverage marker not written: %v", err)
+	}
+
+	// Re-running the configure path (Once reset, marker kept) must not
+	// re-emit: an untouched marker mtime pins the early return.
+	resetRedactionConfiguredForTest()
+	if err := EnsureRedactionConfigured(t.Context()); err != nil {
+		t.Fatalf("EnsureRedactionConfigured() after Once reset = %v, want nil", err)
+	}
+	info2, err := os.Stat(marker)
+	if err != nil {
+		t.Fatalf("marker missing after re-run: %v", err)
+	}
+	if !info2.ModTime().Equal(info.ModTime()) {
+		t.Fatal("marker rewritten on re-run; narrowed-coverage notice re-emitted")
+	}
+}

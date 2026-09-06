@@ -1,0 +1,889 @@
+# Sessions and Checkpoints
+
+## Overview
+
+Entire CLI creates checkpoints for AI coding sessions. The system is agent-agnostic - it works with Claude Code, Codex, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI, or any tool that triggers Entire hooks.
+
+This document covers the domain model shared by both checkpoint storage backends. For how the **git-refs** backend stores checkpoints as one ref per checkpoint — its layout, push/fetch model, read routing, and configuration — see [Ref-Based Checkpoint Backend](ref-checkpoint-backend.md).
+
+## Domain Model
+
+### Session
+
+A **Session** is a unit of work. Defined in `strategy/session.go`:
+
+```go
+type Session struct {
+    ID          string       // e.g., "2025-12-01-8f76b0e8-b8f1-4a87-9186-848bdd83d62e"
+    Description string       // Human-readable summary (first prompt or derived)
+    Strategy    string       // Strategy that created this session
+    StartTime   time.Time
+    Checkpoints []Checkpoint
+}
+```
+
+### Checkpoint
+
+A **Checkpoint** captures a point-in-time within a session. Defined in `strategy/session.go`:
+
+```go
+type Checkpoint struct {
+    CheckpointID     id.CheckpointID // Stable identifier (12-hex or ULID; see Checkpoint ID Linking)
+    Message          string          // Commit message or checkpoint description
+    Timestamp        time.Time
+    IsTaskCheckpoint bool            // Task checkpoint (subagent) vs session checkpoint
+    ToolUseID        string          // Tool use ID for task checkpoints (empty for session)
+}
+```
+
+### Checkpoint Types
+
+The low-level `checkpoint.Type` (from `checkpoint/checkpoint.go`) indicates storage location:
+
+```go
+type Type int
+
+const (
+    Ephemeral Type = iota // Full state snapshot, shadow branch
+    Persistent            // Metadata + commit ref, entire/checkpoints/v1
+)
+```
+
+| Type | Contents | Use Case |
+|------|----------|----------|
+| Ephemeral | Full state (code + metadata) | Pending session state, pre-commit |
+| Persistent | Metadata + commit reference | Permanent record, post-commit |
+
+## Interface
+
+### Session Access
+
+`strategy/session.go` keeps the `Session` and `Checkpoint` data types used by
+status/explain formatting. Active session state is read from `.git/entire-sessions/`
+through `session.StateStore`; committed checkpoint/session content is read
+through the checkpoint facade (`checkpoint.Open(ctx, repo, opts)`, which resolves
+the ref topology and wires the blob fetcher) and command-specific strategy
+methods such as `GetSessionInfo`.
+
+### Checkpoint Storage (Low-Level)
+
+`checkpoint.Open` returns a `*Stores` facade exposing two independent stores,
+split by lifecycle:
+
+- `stores.Persistent` — the permanent record on `entire/checkpoints/v1`
+  (a `PersistentStore`). This is the pluggable surface.
+- `stores.Ephemeral()` — the git-only shadow-branch store for intra-session
+  state (an `EphemeralStore`).
+
+Both present a symmetric generic surface — `Read` (differentiated by return
+type), `Write` (a sealed request union), and `List`:
+
+```go
+type PersistentStore interface {
+    Read(ctx, checkpointID id.CheckpointID) (*CheckpointSummary, error)
+    List(ctx) ([]CheckpointInfo, error)
+    ReadSessionContent(ctx, checkpointID id.CheckpointID, sessionIndex int) (*SessionContent, error)
+    Write(ctx, req WriteRequest) error    // WriteSession / BackfillTranscript / BackfillSummary / BackfillAttribution
+    // ...session reads
+}
+
+type EphemeralStore interface {
+    Read(ctx, baseCommit, worktreeID string) (*ReadEphemeralResult, error)
+    List(ctx) ([]EphemeralInfo, error)
+    Write(ctx, req EphemeralWriteRequest) (WriteEphemeralResult, error) // WriteCheckpoint / WriteTask
+    // ...shadow-branch queries
+}
+```
+
+Writes go through the request unions rather than per-operation methods, so a
+mirror/fan-out store just forwards the request value:
+
+```go
+// Persistent: condensation, stop-time backfill, async summary, attribution
+stores.Persistent.Write(ctx, checkpoint.WriteSession{CheckpointID: id, /* ... */})
+stores.Persistent.Write(ctx, checkpoint.BackfillSummary{CheckpointID: id, Summary: s})
+
+// Ephemeral: shadow-branch capture / task checkpoints
+res, _ := stores.Ephemeral().Write(ctx, checkpoint.WriteCheckpoint{BaseCommit: base, /* ... */})
+```
+
+`WriteSession`/`BackfillTranscript` are defined types over the option structs
+(`WriteOptions`/`UpdateOptions`); `WriteCheckpoint`/`WriteTask` over
+`WriteEphemeralOptions`/`WriteEphemeralTaskOptions`.
+
+Token usage and skill events live in the leaf `agent/types` package (so the
+contract doesn't pull in the full `agent` package):
+
+```go
+type TokenUsage struct {
+    InputTokens         int         `json:"input_tokens"`
+    CacheCreationTokens int         `json:"cache_creation_tokens"`
+    CacheReadTokens     int         `json:"cache_read_tokens"`
+    OutputTokens        int         `json:"output_tokens"`
+    APICallCount        int         `json:"api_call_count"`
+    SubagentTokens      *TokenUsage `json:"subagent_tokens,omitempty"`
+}
+```
+
+### Strategy-Level Operations
+
+Strategies compose low-level primitives into higher-level workflows.
+
+**Manual-commit** has condensation logic:
+
+```go
+// CondenseSession reads accumulated temporary state and writes a committed checkpoint.
+func (s *ManualCommitStrategy) CondenseSession(
+    repo *git.Repository,
+    checkpointID id.CheckpointID,
+    state *SessionState,
+) (*CondenseResult, error)
+```
+
+## Storage
+
+| Type | Location | Contents |
+|------|----------|----------|
+| Session State | `.git/entire-sessions/<id>.json` | Active session tracking |
+| Ephemeral | `entire/<commit[:7]>-<worktreeHash[:6]>` branch | Full state (code + metadata) |
+| Persistent (git-branch) | `entire/checkpoints/v1` branch, sharded `<id[:2]>/<id[2:]>/` | Metadata + commit reference |
+| Persistent (git-refs) | `refs/entire/checkpoints/<shard>/<id>`, one ref per checkpoint | Metadata + commit reference |
+
+The persistent store is pluggable: `git-branch` stores every committed checkpoint as a subtree of a single `entire/checkpoints/v1` branch, while `git-refs` stores one ref per checkpoint. New setups write an explicit backend choice via `entire enable` (`git-refs` recommended and pre-selected); a repo with no checkpoints config still resolves to `git-branch` (the config-less fallback), so pre-existing repos keep their behavior. Both are git-backed and share the same checkpoint tree layout; they differ only in where that tree is committed. This document describes the git-branch layout; for the ref-based backend — its ref naming, sharding, push/fetch model, read routing, and configuration — see [Ref-Based Checkpoint Backend](ref-checkpoint-backend.md).
+
+### Session State
+
+Location: `.git/entire-sessions/<session-id>.json`
+
+Stored in git common dir (shared across worktrees). Tracks active session info.
+
+The state records `Branch` — the branch HEAD pointed at on the session's last turn
+(captured each turn start, so it follows branches created/renamed after the
+session began). `entire resume` (bare, no arg) uses it to list stopped sessions
+and map each back to its branch; for sessions recorded before the field existed
+it falls back to deriving the branch from the session's last checkpoint ID found
+in branch-only commit trailers.
+
+`entire session adopt` moves an active session from a source repo or worktree
+into the current worktree. Adoption preserves the live transcript path, validates
+that the source state still belongs to the requested source worktree, rewrites
+the session's branch/worktree/base metadata to the target, clears target-local
+checkpoint windows and checkpoint IDs, and snapshots the target's current file
+changes so the next commit can link to the adopted session.
+
+#### Commit-to-session linking
+
+The commit hooks (prepare-commit-msg / post-commit) resolve which sessions a
+commit belongs to via `findSessionsForCommitLinking`
+(`strategy/session_identity.go`): the **worktree-matched set** (every session
+with pending content in the commit's worktree — concurrent sessions interleave
+by design) **plus the identity-matched session** when the committing process's
+ancestry names one that path matching missed.
+
+**Identity matching**: reuses the owner fingerprint liveness already
+records — `SessionState.Owner`, a `proclive.Identity` captured on every turn
+start by `captureSessionOwner` (the first non-transient ancestor of the hook:
+agents run hooks as children, possibly via `sh -c`, and proclive skips
+shells, the `entire` binary itself, and the Go toolchain). At commit time the
+hook snapshots its ancestry once (`proclive.CurrentAncestry`) and asks
+`Ancestry.Depth(owner)` per candidate: was this commit's process spawned,
+however indirectly, by that session's agent? Snapshotting once matters — the
+shared store holds one state file per session, so a per-candidate walk would
+repeat the hostname, boot-id, and proc reads dozens of times per commit.
+Host, boot, and start-time guards mean a recycled PID or an identity recorded
+on another machine can never match. The nearest ancestor wins, so a nested
+agent is attributed over the outer agent that spawned it; only sessions
+matching at the same depth (one agent process hosting several sessions) fall
+back to the most recently interacting one. On platforms proclive cannot introspect (Windows),
+identity matching reports nothing and linking falls back to worktree
+matching. This makes an agent-made commit link to
+its own session **in any worktree**, with no bookkeeping to drift. Any session
+matched outside its home worktree is **guest-linked**, whether it came from
+identity matching or the pre-existing single-worktree fallback below: it
+condenses and links, but never mutates worktree-coupled state (`BaseCommit`,
+shadow-branch realignment) — those follow only the session's own worktree HEAD.
+
+**Worktree matching** (always computed; the sole mechanism for commits with
+no recorded agent in their ancestry — human commits, detached runners): exact
+`WorktreePath` match first, then sessions from a sibling worktree of the same
+repo, provided they resolve to a single worktree. Imported sessions (`Kind=imported`) never link —
+they are historical records. When candidates span several worktrees, sessions
+that interacted within the last 15 minutes are preferred; if a single live
+worktree remains it links, otherwise the hook declines with a stderr hint
+naming `entire session adopt` (two genuinely live sessions in different
+worktrees are never guessed between). This liveness filter intentionally turns
+some cases the old code declined outright into a best-candidate link. The
+15-minute `recentSessionWindow` is therefore a correctness tradeoff: a session
+in a long-running build or tool call can age out, allowing the remaining recent
+worktree to win.
+
+Under `go test`, the session state store refuses to open outside the temp
+root (both `session.NewStateStore` and `NewStateStoreForWorktree`), so a test
+missing repo isolation fails loudly instead of leaking fixture sessions into
+a real repo's `.git/entire-sessions` — leaked fixtures once hijacked commit
+linking and produced a dangling `Entire-Checkpoint` trailer.
+
+**Background zombie sweep.** The session-start hook checks the shared
+session-state directory for zombies — non-ended sessions whose owning agent
+process has exited (including the common IDLE case), and ENDED sessions that
+still hold uncondensed checkpoint data more than 24h after ending (younger ones
+are left alone so PostCommit carry-forward keeps its chance). When any exist,
+it spawns a detached
+`__sweep_sessions` process (throttled to one spawn per repo per window via a
+flock-serialized marker in the git common dir) that finalizes/condenses them
+using the same engines as `entire doctor --force`, condense-only: the sweep
+has no interactive condense deadline and never initiates a discard — ended
+sessions without a shadow branch are left to `entire doctor` (and the existing
+orphan cleanup). The 7-day stale-session
+purge bounds the sweep's window: a zombie that stays unfixed past 7 days is
+removed by the purge, not the sweep. See `cmd/entire/cli/session_sweep.go`.
+
+### Temporary Checkpoints
+
+Branch: `entire/<commit[:7]>-<worktreeHash[:6]>`
+
+Contains full worktree snapshot plus metadata overlay. **Multiple concurrent sessions** can share the same shadow branch - their checkpoints interleave:
+
+```
+<worktree files...>
+.entire/metadata/<session-id-1>/
+├── full.jsonl           # Session 1 transcript
+├── prompt.txt           # Checkpoint-scoped user prompts
+└── tasks/<tool-use-id>/ # Post-todo incremental task checkpoints only
+.entire/metadata/<session-id-2>/
+├── full.jsonl           # Session 2 transcript (concurrent)
+├── ...
+```
+
+Tied to a base commit. Condensed to committed on user commit.
+
+**Transcript sanitization (before redaction).** Entire never modifies the agent's
+own transcript, but the copy it stores goes through the agent's optional
+`agent.TranscriptSanitizer` first, at the point Entire takes custody (the Stop path
+in `lifecycle.go`, before `.entire/metadata/<session>/full.jsonl` is written). Codex
+implements it to strip encrypted reasoning payloads and compaction blobs, which are
+bound to the originating session and cannot be replayed out of a checkpoint.
+
+Sanitization always runs before redaction, but the paths differ in whether image
+externalization happens at all:
+
+| Path | Pipeline | Where |
+|---|---|---|
+| Stop (shadow branch) | sanitize → redact | `lifecycle.go` sanitizes before `full.jsonl` is written; the metadata-dir walker (`createRedactedBlobFromFile`) redacts it into the shadow tree |
+| Post-commit condensation | sanitize → externalize → redact | `prepareTranscriptForStorage` in `manual_commit_condensation.go` |
+| Stop finalize (full-session rewrite) | sanitize → externalize → redact | `manual_commit_hooks.go`, before `extractSessionImages` |
+
+**Image externalization runs only on the committed paths** (condensation and
+finalize). The shadow-branch copy is never externalized, so inline images there are
+subject to redaction like any other high-entropy content — do not assume a shadow
+transcript preserves them. Assets and the `assets/manifest.json` index exist only
+under committed checkpoints.
+
+Where all three steps run, each must precede the next. Sanitizing first avoids
+externalizing images out of items that are about to be discarded — that would store
+an asset whose referencing transcript line disappears moments later — and avoids
+redacting megabytes of ciphertext only to throw it away; base64 is the pathological
+input for the entropy layer, so a large Codex rollout otherwise costs tens of seconds
+per Stop *and* per commit. Externalizing before redaction is required because base64
+is high-entropy and redaction would otherwise flag and destroy it.
+
+The sanitize transform is idempotent, so a downstream write path can call it without
+knowing whether an upstream path already did (`checkpoint.sanitizeForAgentType` is
+the store's own belt-and-braces call).
+
+One coupling to respect when changing this: `SessionState.CheckpointTranscriptSize`
+is a growth baseline compared against the shadow transcript blob's size in
+`sessionHasNewContent`, so it must be measured in the same (sanitized) coordinate —
+see `CondenseResult.TranscriptSizeBaseline`. A raw baseline against a sanitized blob
+makes the comparison false forever and the session silently stops condensing.
+
+**Shadow branch lifecycle:**
+- Created on first checkpoint for a base commit
+- Migrated automatically if base commit changes (stash → pull → apply scenario)
+- Deleted after condensation to `entire/checkpoints/v1`
+- Reset if orphaned (no session state file exists)
+
+### Task Records (Subagent Work)
+
+A subagent invocation (Claude Code's Task tool) is captured through a durable
+**task record** — `session.TaskRecord` (json `task_records`) on session state
+(`session/state.go`): `ToolUseID`, `AgentID`, `StartedAt`, `SubagentType`,
+`TaskDescription`, `DeclaredTranscriptPath`, `Files`, `TokenUsage`,
+`CompletedAt` (zero = still in flight). Mid-turn the record is a **pointer,
+not a payload**: the subagent's transcript stays wherever the agent wrote it,
+and the record remembers how to find it — the transcript path the agent's
+stop hook declared (Claude Code's `agent_transcript_path`), with the
+agent-layout convention as fallback. Nothing is written to the shadow branch
+for task work; the payload is materialized at condensation (below).
+
+**Producers.**
+
+- **Background launch** (`run_in_background: true` in the Task tool's input):
+  Claude Code's PostToolUse for a backgrounded Task fires at the launch
+  acknowledgment, seconds after dispatch, so the launch only records an
+  in-flight record and captures nothing. `SubagentType`/`TaskDescription` are
+  captured here because `SubagentStop`'s payload carries none of them.
+- **Foreground completion** (post-task, non-final): PostToolUse fires at true
+  completion, so the record is created-and-completed in one step, files and
+  transcript path attached.
+- **SubagentStop (final, authoritative)**: the real completion signal for
+  background tasks. `handleSubagentStopFinal` completes the live record —
+  bypassing any "no changes, skip" instinct: a read-only subagent (reviewer,
+  search agent) still produced a transcript worth materializing. File
+  attribution is analyzer-only (the subagent's own transcript, never a
+  whole-worktree scan that would sweep in the parent's concurrent work); the
+  accepted trade is that shell side-effect files the transcript never names,
+  and deletions, are under-captured. A record already completed (foreground
+  dedup, duplicate/racing Final event) is skipped.
+- **SessionEnd sweep** (`completeLiveTaskRecords`): a session closing with
+  tasks still in flight completes every remaining live record, strictly
+  **before** `endSessionNow` marks `PhaseEnded` and eagerly condenses, so the
+  condense materializes them.
+- **Factory Droid Workers** upsert (`UpsertCompletedTaskRecord`): a worker
+  spans multiple turns, so repeat completions merge files into the same record
+  instead of claiming exactly-once.
+
+**Exactly-once completion.** Completion goes through
+`strategy.CompleteTaskRecord`: one `MutateSessionState` closure marks
+`CompletedAt` exactly once (a racing duplicate sees false and skips), attaches
+the extraction results (files, token usage, declared transcript path) to the
+claimed record, and merges files into the session's `FilesTouched`. Completion
+happens **last**, after successful extraction, so a failed capture leaves the
+record live for the SessionEnd sweep to retry. Late-arrival guard: a
+`SubagentStop` whose parent session state is missing entirely skips outright —
+re-creating state would resurrect a zombie session; state present but
+`PhaseEnded` → complete the record, then eagerly condense
+(`CondenseAndMarkFullyCondensed`) so it doesn't linger as post-condensation
+data. Hard-killed agents get the same terminal state from the exited-owner
+sweep (`finalizeExitedSessions`, run inside `entire status`/`doctor`), which
+completes live records before ending the session — the transcript-so-far
+still reaches a permanent checkpoint.
+
+**Materialization (condensation).** `materializeTaskRecords`
+(`manual_commit_condensation.go`) resolves each record's transcript — declared
+path first, agent-layout fallback — runs the same sanitize → externalize →
+redact pipeline the session transcript gets
+(`prepareTaskTranscriptForStorage`), and writes
+`tasks/<tool-use-id>/{agent-<agent-id>.jsonl, task.json}` inside the parent
+session's checkpoint, on both persistent backends via the shared
+`applySessionWrite`. An unresolvable, unreadable, or empty transcript still
+gets a `task.json` carrying a stable, path-free
+`transcript_unavailable_reason` — the record is never silently dropped.
+Records with an empty/unsafe `ToolUseID` or `AgentID` are skipped with a
+warning, never allowed to wedge condensation.
+
+**Self-contained checkpoints.** Live records are materialized too: each
+condensation stores the transcript-so-far, so a mid-task commit carries a
+partial transcript and a later checkpoint carries the full one — the same
+self-containment rule the compact transcript follows. Live records survive
+condensation for retry; completed records are removed only after a successful
+write (`removeCompletedTaskRecords`, run from `resetCheckpointWindow`).
+
+**Trigger currency.** "Does this session have task content?" is
+`State.HasTaskContent()` (`len(TaskRecords) > 0`) everywhere — condensation
+triggers, empty-session guards, doctor classification, shadow-branch
+deletability. Records never touch the shadow branch: a records-only session
+(no shadow branch, no steps, empty parent transcript) still condenses, and
+shadow-branch existence no longer implies task content (shadow pinning keys on
+`StepCount` only). `checkpoint list --pending` renders `[Task]` rows from
+records, with `Running`/`Completed` verbs.
+
+**Shadow-branch task checkpoints** still exist in exactly one form: post-todo
+incrementals. `SaveTaskStep` (`strategy/manual_commit_git.go`) is formally
+incremental-only — it errors on non-incremental use — and its sole production
+caller is the Claude Code post-todo hook, writing under
+`.entire/metadata/<session-id>/tasks/<tool-use-id>/` when a TodoWrite fires
+inside a subagent.
+
+**Commit linkage while idle.** A background subagent's `git commit` normally
+lands between the parent session's turns, while the session is IDLE — the
+fast-path trailer decision (`tryAgentCommitFastPath`,
+`strategy/manual_commit_hooks.go`) used to trust only ACTIVE sessions, so
+these commits shipped with no `Entire-Checkpoint` trailer at all. An IDLE
+session with a fresh task record (`idleWithTaskContent`: in-flight or
+completed-unmaterialized, each record bounded by its `StartedAt` age against
+`activeSessionInteractionThreshold`, 24h) is now linkable too, so a subagent
+that dies without a completion signal doesn't leave the session trusted
+forever. The same predicate feeds `shouldCondenseWithOverlapCheck`'s
+overlap-check bypass, so the trigger and the condensation trust share one
+rule. The trailer's content guarantee is the materializer itself: the
+commit's condensation stores each record's transcript-so-far under the
+checkpoint's `tasks/` subtree, so no separate commit-time capture is needed.
+Ordinary idle commits with no task records are unaffected — they stay exactly
+as before.
+
+### Committed Checkpoints
+
+Branch: `entire/checkpoints/v1`
+
+Committed checkpoints sync to exactly one git remote — the elected checkpoint
+sync remote, resolved in this order:
+
+1. `strategy_options.checkpoint_push_remote` if set — fail-closed when it
+   names a remote that is not configured (checkpoint sync is disabled until
+   fixed, since this is explicit user intent).
+2. The **captured** election, if its remote is still configured — fail-soft
+   otherwise (capture is automatic state, so a renamed/removed remote falls
+   through instead of disabling sync).
+3. `origin`, if configured.
+4. The sole configured remote.
+5. The first remote in `.git/config` order.
+
+**Capture** is how the election follows the user's actual push habit with
+zero configuration: during pre-push, when the push target agrees with the
+branch's declared push destination (`branch.<name>.pushRemote` →
+`remote.pushDefault` → `branch.<name>.remote` — the config a bare `git push`
+resolves through) and differs from the current election, that remote is
+persisted as the captured election (git common dir,
+`entire-checkpoint-sync-remotes.json`, list-shaped for the future multi-remote
+set), a one-line stderr notice announces the change, and the same push carries
+the checkpoints. Declaration alone never elects (the config-at-rest bug that
+got the static tracking tier dropped in `74e239a9` — it turned pushes to every
+other remote into silent no-ops, e.g. `git clone -o base` pushing a separately
+added `origin`); a bare push to an undeclared remote never elects either (the
+pre-single-remote transcript leak). Phase-1 rules: at most one captured
+remote, and the first still-configured capture sticks — a mixed-habit repo whose branches push
+two remotes must not flip the election per push. An explicit
+`checkpoint_push_remote` always outranks and disables capture. See
+`strategy/checkpoint_sync_capture.go`.
+
+For the fork setup where `origin` is an unpushable base repo, capture elects
+the fork automatically on the first tracked push; `checkpoint_push_remote`
+remains the explicit override.
+
+The pre-push hook carries checkpoint data only when the push targets the
+elected remote; pushes to any other remote or to a raw URL sync nothing, on
+both the git-branch and git-refs backends (git-refs leaves its push queue
+intact for the next elected-remote push). The dedicated `checkpoint_remote`
+URL mode is exempt — it addresses a separate metadata store directly. `entire
+status` shows the sync destination and how many checkpoints have not reached
+it yet.
+
+A gated push is not fully silent: when checkpoints are waiting for the
+elected remote, the hook prints a two-line stderr hint naming the elected
+destination, the waiting count, and the `checkpoint_push_remote` setting
+(pointed at `.entire/settings.local.json` — a remote name is a per-clone
+fact) that re-routes sync to the remote being pushed. The hint stays quiet
+when the election was explicit (`checkpoint_push_remote` is already set),
+when the push target is a raw URL rather than a configured remote, when
+nothing is waiting, when the election failed (the fail-closed case logs a
+warning instead), and when the push target is not the branch's declared push
+destination — a deploy target or a one-off `git push upstream` must never be
+recommended as the checkpoint sync remote, which would publish transcripts
+there. With capture taking a declared destination on the first agreeing push,
+what remains for the hint is a declared remote capture will not elect because
+one is already in force (phase-1 first-capture-sticks), where naming the
+setting is genuinely the only way to re-route. See `hintGatedCheckpointSync` in
+`strategy/checkpoint_sync_remote.go`.
+
+**Reads follow the election.** Where writes confine to one remote, reads
+consult an ordered candidate chain: the elected sync remote first, then
+`origin` as a **read-only legacy tier** — every pre-election repo has its
+checkpoint data on origin, and a fresh clone may lack the local settings that
+elected something else. `strategy.CheckpointReadRemotes` (and
+`CheckpointReadRemotesWithElection`, which bundles the election result for
+callers that need both) resolves the chain, failing *open* to `[origin]` when
+the election fails — failing reads closed would only prevent *finding* data.
+Every checkpoint-data read iterates the chain per operation (metadata-branch
+fetches, tracking-ref readers, per-checkpoint ref fetches, blob hydration,
+checkpoint-policy reads). Metadata-branch fetches refresh every candidate's
+tracking ref because branch existence alone does not prove that branch contains
+the requested checkpoint; they succeed when any candidate fetch succeeds.
+Other reads try candidates in order, advancing on missing data or transport
+failure and surfacing the first candidate's error when all fail. Local-ref advancement stays
+**elected-remote-only** — `EnsurePrimaryRef`, the metadata-fetch advance step,
+`promoteRemoteTrackingPrimary`, and the local checkpoint-policy ref update
+never act on the legacy tier, keyed on the explicit election result rather
+than the chain's first entry (a stale origin feeding `SafelyAdvanceLocalRef`
+would replay local v1 onto stale history — the issue-#1374 hazard). Legacy
+data on origin is therefore served through origin's *tracking ref* (resume's
+final metadata tier and the store's tracking-ref fallback), never by moving
+local refs. A repository with no remotes keeps its "checkpoint absent"
+classification, which requires positive evidence on every axis (a successful
+empty `git remote` listing, a live context, readable settings without a
+`checkpoint_remote` key).
+
+Metadata only, sharded by checkpoint ID. Supports **multiple sessions per checkpoint**:
+
+```
+<id[:2]>/<id[2:]>/
+├── metadata.json        # CheckpointSummary (aggregated stats)
+├── 0/                   # First session (0-based indexing)
+│   ├── metadata.json    # Session-specific Metadata
+│   ├── full.jsonl       # Agent transcript, sanitized + redacted (CLI resume/explain)
+│   ├── transcript.jsonl # Full compacted session (slice at compact_transcript_start)
+│   ├── prompt.txt       # Checkpoint-scoped user prompts
+│   └── content_hash.txt # sha256 of full.jsonl (dedup short-circuit)
+├── 1/                   # Second session
+│   ├── metadata.json
+│   ├── full.jsonl
+│   └── ...
+├── 2/                   # Third session...
+└── tasks/<tool-use-id>/ # Subagent task records, materialized at condensation
+    ├── agent-<agent-id>.jsonl # Subagent transcript, sanitized + redacted (omitted when unavailable)
+    └── task.json        # Record metadata (files, tokens, timings, unavailable reason); description redacted at write
+```
+
+**Compact transcript (`transcript.jsonl`):** generated best-effort from
+`full.jsonl` via `transcript/compact` on every committed write and on
+transcript replacement during finalization. Like `full.jsonl`, it stores the
+**full compacted session** on every checkpoint (via `compact.FullWithBoundary`),
+so each checkpoint is self-contained — the session is reconstructable from any
+single surviving checkpoint, robust to a mid-history checkpoint being lost,
+reverted, or dropped during a rebase. This checkpoint's slice begins at the
+session metadata's `compact_transcript_start` (a line offset into
+`transcript.jsonl`, in compact-output coordinates — distinct from
+`checkpoint_transcript_start`, which indexes raw `full.jsonl` lines).
+Consumers segment this checkpoint's content as `compactLines[compact_transcript_start:]`.
+The marker rounds toward inclusion when a streaming message straddles the
+boundary (compaction merges same-ID fragments into one line that cannot be
+split), so the slice never drops this checkpoint's content but its head may
+repeat at most one merged line from the previous checkpoint — segmenters must
+tolerate that bounded overlap. A nil/absent `compact_transcript_start` marks a
+legacy checkpoint whose `transcript.jsonl` holds only its own delta (pre-change
+CLI versions); read it as-is from line 0.
+
+It is written into the checkpoint tree and pushed alongside `full.jsonl`. The
+root `metadata.json` `sessions[].transcript` pointer keeps targeting
+`full.jsonl`; when a compact transcript was generated the session entry also
+carries a `compact_transcript` path pointing at `transcript.jsonl` (omitted
+otherwise) so external readers can find it next to `full.jsonl`.
+CLI read paths (resume/explain) read `full.jsonl` by filename. Compact
+generation is best-effort: failures are logged but never fail the checkpoint
+write. It is also **skipped when the compacted output exceeds the 50MB blob cap**
+— unlike `full.jsonl`, `transcript.jsonl` is not chunked, so a very long session
+whose full compaction exceeds the cap will lack a compact transcript on those
+checkpoints. This is a known limitation; `full.jsonl` remains authoritative and
+the compact transcript is regenerable from it. During the OPF finalize rewrite, a
+failed or skipped regeneration **drops** the prior `transcript.jsonl` and clears
+`compact_transcript_start` rather than shipping a stale, less-redacted compact.
+
+**Root-level metadata.json (`CheckpointSummary`):**
+```json
+{
+  "cli_version": "0.0.0-dev",
+  "checkpoint_id": "abc123def456",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 3,
+  "files_touched": ["file1.txt", "file2.txt"],
+  "sessions": [
+    {
+      "metadata": "/ab/c123def456/0/metadata.json",
+      "transcript": "/ab/c123def456/0/full.jsonl",
+      "compact_transcript": "/ab/c123def456/0/transcript.jsonl",
+      "content_hash": "/ab/c123def456/0/content_hash.txt",
+      "prompt": "/ab/c123def456/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1500,
+    "cache_creation_tokens": 200,
+    "cache_read_tokens": 800,
+    "output_tokens": 500,
+    "api_call_count": 3
+  }
+}
+```
+
+`checkpoints_count` in the root summary is the aggregate displayed "steps" count: the sum of per-session prompt-window counts. Despite the historical name, it is not a count of checkpoint records.
+
+**Session-level metadata.json (`Metadata`, abbreviated):**
+```json
+{
+  "checkpoint_id": "abc123def456",
+  "session_id": "2025-12-01-8f76b0e8-b8f1-4a87-9186-848bdd83d62e",
+  "strategy": "manual-commit",
+  "created_at": "2025-12-01T12:34:56Z",
+  "branch": "main",
+  "checkpoints_count": 3,
+  "save_step_count": 3,
+  "files_touched": ["file1.txt", "file2.txt"]
+}
+```
+
+In session metadata, `checkpoints_count` is the displayed prompt-window count for that session. `save_step_count` records SaveStep-created shadow-branch commits and is the conservative "real checkpoint work happened" signal; it is omitted when zero (for example, commit-only/fallback sessions). `save_step_count` is not aggregated into the root `CheckpointSummary`.
+
+When condensing multiple concurrent sessions:
+- All sessions are stored in numbered subdirectories using 0-based indexing (`0/`, `1/`, `2/`, ...)
+- Each `session_id` is assigned a stable index; subsequent writes for the same session reuse the same numbered folder
+- New `session_id` values are appended at the next index, so higher-numbered folders correspond to more recently introduced sessions, not necessarily the chronologically latest activity
+- `sessions` array in `CheckpointSummary` maps each session to its file paths
+- `files_touched` is merged from all sessions
+
+Checkpoints written by `entire import <agent>` additionally carry a `commit_sha`
+(omitempty) on both the session `Metadata` and the root `CheckpointSummary`,
+set to the default branch's head at import time — origin's tip is preferred
+(the commit the server already knows about), falling back to the local branch
+tip, then HEAD, then empty when nothing resolves. When the transcript itself
+records the commit(s) a turn made (Claude Code `gitOperation` records), the
+turn's checkpoint instead anchors to the last such commit that resolves and is
+reachable from the resolved link anchor (the default-branch head when
+resolvable) — see `turnAnchorResolver` (`agentimport/turn_anchor.go`);
+otherwise (older transcripts, or a recorded commit that's been
+squashed/rebased away) it falls back to the default-branch head as described
+above. It is a best-effort anchor for UI display only, not
+an attribution signal, and pre-existing imported checkpoints are not
+backfilled with it.
+
+### Checkpoint Policy
+
+Repo-wide checkpoint policy lives at `refs/entire/policies/checkpoint`. The ref
+points at a commit whose tree contains `policy.json`:
+
+```json
+{
+  "checkpoint_version": "branch-v1",
+  "checkpoint_min_version": "branch-v1"
+}
+```
+
+Either field may be omitted. An empty policy file means both fields inherit the
+CLI defaults:
+
+```json
+{}
+```
+
+`checkpoint_version` is a checkpoint-data write guard. If no policy is
+configured, a policy omits `checkpoint_version`, or the field was set to an
+empty string with `entire checkpoint policy --checkpoint-version ""`, the CLI
+uses its default checkpoint version for policy decisions. The quotes are
+required so the shell passes an empty value instead of omitting the flag value.
+If another client configures a `checkpoint_version` this CLI cannot write,
+explicit checkpoint-data writers fail until the CLI is upgraded.
+
+`checkpoint_min_version` is an upgrade nudge and checkpoint-data write guard.
+Clients that cannot read that version warn users to upgrade. Explicit
+checkpoint-data writers fail until the CLI is upgraded. If no policy is
+configured, a policy omits `checkpoint_min_version`, or the field was set to an
+empty string with `entire checkpoint policy --checkpoint-min-version ""`, the
+CLI uses its default minimum checkpoint version for policy decisions.
+
+Unsetting a field is still evaluated against the normal downgrade guard. If the
+field's current effective version is newer than the default inherited after
+unsetting, `entire checkpoint policy` rejects the change unless `--force` is
+passed.
+
+`entire checkpoint policy` validates requested policy values against the
+current CLI, so it rejects setting unsupported checkpoint versions.
+
+Policy follows the configured checkpoint remote. `entire checkpoint policy`
+fetches the latest remote policy before validating requested changes, updates
+the local policy ref, and pushes only `refs/entire/policies/checkpoint`.
+Policy commits use the same signing settings as checkpoint commits.
+
+Agent session-start hooks warn that checkpoint capture is disabled for the
+session and exit successfully. Other agent hooks fail with a checkpoint-disabled
+message so the agent can see that no Entire checkpoints will be generated until
+the CLI is upgraded.
+
+Git hooks never block Git because of checkpoint policy. When the policy cannot
+be satisfied, Git hooks log the violation, warn only in an interactive
+terminal, skip Entire checkpoint work, and exit successfully. Pre-push refreshes
+policy first, then applies the same skip behavior to checkpoint push work.
+
+User-driven commands warn when the local policy indicates the CLI should be
+upgraded. Explicit checkpoint-data writers such as `entire session attach`,
+`entire checkpoint explain --generate`, and `entire import <agent>` fail when
+the local policy cannot be satisfied.
+
+### Checkpoint ID Linking
+
+The checkpoint ID is the **stable identifier** that links user commits to metadata across branches.
+
+**Format:** one of two shapes — do **not** assume a fixed width:
+- **Legacy 12-hex** random ID (e.g., `a3b2c4d5e6f7`) — the git-branch store's format.
+- **26-char ULID** (Crockford base32, e.g., `01KVBJCWYA4YW6J5M9GP655HZN`) — minted only
+  under the git-refs checkpoint store. A ULID's leading chars encode a millisecond
+  timestamp (so it is lexicographically time-sortable) and its tail is random; front
+  prefixes are therefore ambiguous — trim ULIDs from nowhere / show them in full for
+  display (see `id.CheckpointID.DisplayShort`), and use `id.MaxIDLength`, not a
+  hardcoded 12, when reasoning about maximum width.
+
+Both formats are validated by `id.KindOf` / `id.Validate`; readers accept either.
+
+**Read routing (`checkpoint.Open` → `kindRoutingStore`):** id-keyed reads resolve
+across both git backends by the checkpoint's format, so a repo running git-refs
+and git-branch side by side (or mid-migration) reads either format without
+reconfiguring:
+- A **ULID** is read from the git-refs store only — never the branch.
+- A **hex** ID is read from the active (configured) primary first; when the
+  primary is git-refs it also falls back to the git-branch store (a hex checkpoint
+  may still sit on the pre-migration v1 branch, or have been migrated into refs).
+- `List` unions both backends. **Creates (`Session`) are not kind-routed** — they
+  go to the configured primary (+ mirrors); the minted ID already matches the
+  primary. **Backfills** (summary/transcript/attribution) update an existing
+  checkpoint and ARE kind-routed: they follow the read order, falling through to
+  the next store only on `ErrCheckpointNotFound`.
+
+**Generation:**
+- Minted by `checkpoint.GenerateCheckpointID`, which picks the format from the
+  configured primary store (ULID under git-refs, 12-hex otherwise). Do not call
+  `id.Generate()` / `id.GenerateULID()` directly from a checkpoint write path.
+- Generated during condensation (post-commit hook)
+
+**Usage:**
+
+1. **User commit trailer**:
+   - `Entire-Checkpoint: a3b2c4d5e6f7` added to user's commit message
+   - Added by `prepare-commit-msg` hook (user can remove)
+
+2. **Directory sharding** on `entire/checkpoints/v1`:
+   - Path: `<id[:2]>/<id[2:]>/` (e.g., `a3/b2c4d5e6f7/`)
+   - First 2 chars = shard (256 possible shards)
+   - Remaining 10 chars = directory name
+
+3. **Commit subject** on `entire/checkpoints/v1`:
+   - Format: `Checkpoint: a3b2c4d5e6f7`
+   - Makes `git log entire/checkpoints/v1` readable
+
+**Bidirectional Lookup:**
+
+```
+User commit → Metadata:
+  1. Extract "Entire-Checkpoint: a3b2c4d5e6f7" from commit message
+  2. Read entire/checkpoints/v1 tree at a3/b2c4d5e6f7/
+
+Metadata → User commits:
+  Given checkpoint ID a3b2c4d5e6f7
+  → Search branch history for commits with "Entire-Checkpoint: a3b2c4d5e6f7"
+```
+
+Note: Commit subjects on `entire/checkpoints/v1` (e.g., `Checkpoint: a3b2c4d5e6f7`)
+are for human readability in `git log` only. The CLI always reads from the tree at HEAD.
+
+**Example Flow:**
+
+```
+                    User creates commit
+                           ↓
+           prepare-commit-msg hook adds trailer
+                           ↓
+┌──────────────────────────────────────────────────┐
+│ Commit on main branch:                           │
+│   "Implement login feature                       │
+│                                                   │
+│   Entire-Checkpoint: a3b2c4d5e6f7"               │
+└──────────────────────────────────────────────────┘
+                           ↓
+                  post-commit hook runs
+                           ↓
+          Condense shadow → entire/checkpoints/v1
+                           ↓
+┌──────────────────────────────────────────────────┐
+│ Commit on entire/checkpoints/v1:                 │
+│   Subject: "Checkpoint: a3b2c4d5e6f7"            │
+│                                                   │
+│   Tree: a3/b2c4d5e6f7/                           │
+│     ├── metadata.json                            │
+│     │   (checkpoint_id: "a3b2c4d5e6f7")          │
+│     ├── 0/                                       │
+│     │   ├── full.jsonl                           │
+│     │   ├── transcript.jsonl                     │
+│     │   └── prompt.txt                           │
+│     └── ...                                      │
+│                                                   │
+│   Trailers:                                      │
+│     Entire-Session: 2026-01-20-uuid              │
+│     Entire-Strategy: manual-commit               │
+└──────────────────────────────────────────────────┘
+```
+
+The checkpoint ID creates a **bidirectional link**: user commits can find their metadata, and metadata can find the commits that reference it.
+
+### Package Structure
+
+```
+strategy/
+├── session.go           # Session and Checkpoint types
+
+session/
+├── state.go             # Active session state (StateStore, .git/entire-sessions/)
+├── phase.go             # Session phase state machine (ACTIVE, IDLE, ENDED, etc.)
+
+checkpoint/
+├── checkpoint.go        # checkpoint.Type, store interfaces, CheckpointSummary, etc.
+├── open.go              # Open() facade: resolves topology, wires stores + fetchers
+├── registry.go          # Backend registry + gitBacked capability (git-branch, git-refs)
+├── routing_store.go     # kindRoutingStore: id-kind read routing across both backends
+├── fanout.go            # Mirror write fan-out (primary + best-effort mirrors)
+├── generate.go          # GenerateCheckpointID (format follows the configured primary)
+├── persistent.go        # git-branch persistent store (entire/checkpoints/v1)
+├── persistent_write.go  # git-branch write path (treeWriter, subtree splicing)
+├── refs_store.go        # git-refs persistent store (one ref per checkpoint)
+├── refs_naming.go       # RefName / ParseRef, CheckpointRefPrefix, sharding
+├── pushqueue.go         # git-refs push-discovery queue (flock JSONL)
+├── ephemeral.go         # Shadow-branch (ephemeral) store
+├── fsstore/             # Filesystem mirror backend (non-git-backed, mirror-only)
+├── id/                  # CheckpointID type, Kind/KindOf, ShardFor, generation
+│   └── id.go
+```
+
+Strategies use the `checkpoint.Open` facade and store primitives - backend and storage details are encapsulated.
+
+## Strategy Role
+
+Strategies determine checkpoint timing and type:
+
+| Event | Checkpoint Type |
+|-------|----------------|
+| On Save | Temporary |
+| On Task Complete | Task record on session state → materialized at condensation |
+| On User Commit | Condense → Committed |
+
+## Pending Checkpoints
+
+Each `PendingCheckpoint` includes `SessionID` and `SessionPrompt` to help identify which checkpoint belongs to which session when multiple sessions are interleaved.
+
+`checkpoint list --pending` is the resume view of the current branch, and a
+`PendingCheckpoint` row is one of two things:
+
+- a **live checkpoint** on the session's shadow branch, not yet condensed onto
+  `entire/checkpoints/v1`; or
+- a **logs-only resume point** — a commit on the current branch whose
+  `Entire-Checkpoint` trailer resolves to a checkpoint that *is* already
+  condensed onto `entire/checkpoints/v1`, listed so its session transcript can
+  be restored from there (file state would need a git checkout).
+
+So "pending" describes the listing, not a guarantee that the work behind every
+row is un-condensed: `ListLogsOnlyPendingCheckpoints` builds the second kind by
+scanning branch history against committed checkpoint storage.
+
+Either shape can be listed and resumed from, but the CLI cannot restore working
+files to it: the file-restoring path (`Rewind`, `PreviewRewind`, `CanRewind`) was
+removed along with the `rewind` commands. `RestoreLogsOnly` still writes a
+checkpoint's session logs into the agent's session directory for
+`entire resume`, and leaves the worktree alone.
+
+## Concurrent Sessions
+
+Multiple AI sessions can run concurrently on the same base commit:
+
+1. **Warning on start** - When a second session starts while another has uncommitted checkpoints, a warning is shown
+2. **Both proceed** - User can continue; checkpoints interleave on the same shadow branch
+3. **Identification** - Each checkpoint is tagged with its session ID; `checkpoint list --pending` shows the session prompt
+4. **Condensation** - On commit, all sessions are condensed together with archived subfolders
+
+### Conflict Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Concurrent sessions (same worktree) | Warning shown, both proceed |
+| Orphaned shadow branch (no state file) | Branch reset, new session proceeds |
+| Cross-worktree conflict (state file exists) | `SessionIDConflictError` returned |
+
+### Shadow Branch Migration
+
+If user does stash → pull → apply (HEAD changes without commit):
+- Detection: base commit changed AND old shadow branch still exists
+- Action: branch renamed from `entire/<old-commit[:7]>-<worktreeHash[:6]>` to `entire/<new-commit[:7]>-<worktreeHash[:6]>`
+- Result: session continues with checkpoints preserved
+
+---
+
+## Appendix: Legacy Names
+
+| Current | Legacy |
+|---------|--------|
+| Manual-commit | Shadow |

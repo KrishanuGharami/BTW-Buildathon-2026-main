@@ -1,0 +1,181 @@
+package cli
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestMarkSessionEnded_SetsPhaseEnded verifies that markSessionEnded
+// transitions the session phase to ENDED via the state machine.
+func TestMarkSessionEnded_SetsPhaseEnded(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	// Create a session in ACTIVE phase
+	state := &strategy.SessionState{
+		SessionID:  "test-session-end-1",
+		BaseCommit: "abc123",
+		StartedAt:  time.Now(),
+		Phase:      session.PhaseActive,
+	}
+	err := strategy.SaveSessionState(context.Background(), state)
+	require.NoError(t, err)
+
+	// Call markSessionEnded
+	_, err = markSessionEnded(context.Background(), nil, "test-session-end-1", nil, endedNow)
+	require.NoError(t, err)
+
+	// Verify phase is ENDED
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-1")
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+
+	assert.Equal(t, session.PhaseEnded, loaded.Phase,
+		"markSessionEnded should set phase to ENDED")
+	require.NotNil(t, loaded.EndedAt,
+		"markSessionEnded should set EndedAt")
+	require.NotNil(t, loaded.LastInteractionTime,
+		"markSessionEnded should set LastInteractionTime")
+}
+
+func TestMarkSessionEnded_ReservesEagerCondensationAttempt(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	state := &strategy.SessionState{
+		SessionID: "test-session-end-reservation",
+		StartedAt: time.Now(),
+		Phase:     session.PhaseActive,
+		StepCount: 1,
+	}
+	require.NoError(t, strategy.SaveSessionState(context.Background(), state))
+
+	_, err := markSessionEnded(context.Background(), nil, state.SessionID, nil, endedNow)
+	require.NoError(t, err)
+
+	loaded, err := strategy.LoadSessionState(context.Background(), state.SessionID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	require.False(t, loaded.PendingCondensationID().IsEmpty())
+}
+
+func TestMarkSessionEnded_EmptySessionMarksFullyCondensed(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	state := &strategy.SessionState{
+		SessionID: "test-session-end-empty",
+		StartedAt: time.Now(),
+		Phase:     session.PhaseActive,
+	}
+	require.NoError(t, strategy.SaveSessionState(context.Background(), state))
+
+	_, err := markSessionEnded(context.Background(), nil, state.SessionID, nil, endedNow)
+	require.NoError(t, err)
+
+	loaded, err := strategy.LoadSessionState(context.Background(), state.SessionID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	assert.True(t, loaded.FullyCondensed)
+	assert.True(t, loaded.PendingCondensationID().IsEmpty())
+}
+
+// TestMarkSessionEnded_IdleToEnded verifies IDLE → ENDED transition.
+func TestMarkSessionEnded_IdleToEnded(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	state := &strategy.SessionState{
+		SessionID:  "test-session-end-idle",
+		BaseCommit: "abc123",
+		StartedAt:  time.Now(),
+		Phase:      session.PhaseIdle,
+	}
+	err := strategy.SaveSessionState(context.Background(), state)
+	require.NoError(t, err)
+
+	_, err = markSessionEnded(context.Background(), nil, "test-session-end-idle", nil, endedNow)
+	require.NoError(t, err)
+
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-idle")
+	require.NoError(t, err)
+	assert.Equal(t, session.PhaseEnded, loaded.Phase)
+	require.NotNil(t, loaded.EndedAt)
+}
+
+// TestMarkSessionEnded_AlreadyEndedIsNoop verifies ENDED → ENDED (no-op).
+func TestMarkSessionEnded_AlreadyEndedIsNoop(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	originalEndedAt := time.Now().Add(-time.Hour)
+	state := &strategy.SessionState{
+		SessionID:  "test-session-end-noop",
+		BaseCommit: "abc123",
+		StartedAt:  time.Now(),
+		Phase:      session.PhaseEnded,
+		EndedAt:    &originalEndedAt,
+	}
+	err := strategy.SaveSessionState(context.Background(), state)
+	require.NoError(t, err)
+
+	_, err = markSessionEnded(context.Background(), nil, "test-session-end-noop", nil, endedNow)
+	require.NoError(t, err)
+
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-noop")
+	require.NoError(t, err)
+	assert.Equal(t, session.PhaseEnded, loaded.Phase)
+	// EndedAt should still be set (updated, not cleared)
+	require.NotNil(t, loaded.EndedAt)
+}
+
+// TestMarkSessionEnded_EmptyPhaseBackwardCompat verifies that sessions
+// without a Phase field get properly transitioned.
+func TestMarkSessionEnded_EmptyPhaseBackwardCompat(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	state := &strategy.SessionState{
+		SessionID:  "test-session-end-compat",
+		BaseCommit: "abc123",
+		StartedAt:  time.Now(),
+		Phase:      "", // pre-state-machine
+	}
+	err := strategy.SaveSessionState(context.Background(), state)
+	require.NoError(t, err)
+
+	_, err = markSessionEnded(context.Background(), nil, "test-session-end-compat", nil, endedNow)
+	require.NoError(t, err)
+
+	loaded, err := strategy.LoadSessionState(context.Background(), "test-session-end-compat")
+	require.NoError(t, err)
+	assert.Equal(t, session.PhaseEnded, loaded.Phase,
+		"empty phase → IDLE → ENDED")
+}
+
+// TestMarkSessionEnded_NoState verifies that markSessionEnded is a no-op
+// when no session state exists.
+func TestMarkSessionEnded_NoState(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+
+	_, err := markSessionEnded(context.Background(), nil, "nonexistent-session", nil, endedNow)
+	assert.NoError(t, err, "should be a no-op when no state exists")
+}
+
+// setupGitRepoForPhaseTest creates a temp directory with an initialized git repo.
+func setupGitRepoForPhaseTest(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	return dir
+}

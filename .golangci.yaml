@@ -1,0 +1,175 @@
+version: "2"
+# Without these, every `//go:build integration` and `//go:build e2e` file is
+# invisible to golangci-lint.
+run:
+  build-tags:
+    - integration
+    - e2e
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+linters:
+  default: standard
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - copyloopvar
+    - decorder
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - exptostd
+    - forbidigo
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - gochecksumtype
+    - goconst
+    - gocritic
+    - gosec
+    - govet
+    - grouper
+    - iface
+    - importas
+    - inamedparam
+    - ineffassign
+    - intrange
+    - loggercheck
+    - maintidx
+    - makezero
+    - mirror
+    - misspell
+    - musttag
+    - nakedret
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - promlinter
+    - protogetter
+    - reassign
+    - recvcheck
+    - revive
+    - sloglint
+    - spancheck
+    - staticcheck
+    - tagalign
+    - testableexamples
+    - testifylint
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+    - wrapcheck
+  settings:
+    gosec:
+      excludes:
+        - G204 # subprocess with variables is expected for git/opencode CLI wrappers
+        - G702 # command injection via taint - controlled CLI inputs
+        - G705 # XSS not applicable to CLI stderr output
+    dupl:
+      # Token threshold for duplication detection
+      # Lower = more sensitive (catches smaller duplicates)
+      # Default is 150. We use 75 for lint (blocks CI), `mise run dup` uses 50 (advisory)
+      threshold: 75
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    wrapcheck:
+      # Errors from the generated control-plane client are mapped centrally
+      # by renderCoreError (cmd/entire/cli/corecmd.go), which extracts the
+      # RFC 7807 problem detail via errors.As. Per-call-site wrapping would
+      # only be unwrapped again, so the command closures return coreapi
+      # errors verbatim.
+      #
+      # checkpointpolicy.EnsureCanReadVersion already returns a clean,
+      # user-facing message (including the checkpoint ID and version), and
+      # callers classify it via IsUnsupportedVersion. Wrapping would obscure
+      # that purpose-built message, so call sites return it verbatim.
+      ignore-package-globs:
+        - github.com/entireio/cli/internal/coreapi
+        - github.com/entireio/cli/cmd/entire/cli/checkpointpolicy
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^os\.Getwd$'
+          msg: "os.Getwd() breaks when running from subdirectories - use paths.RepoRoot() for git-relative paths"
+          pkg: '^os$'
+        - pattern: '^.*\.Reset$'
+          msg: "go-git Reset deletes .gitignored dirs - use HardResetWithProtection() from common.go"
+          pkg: 'github\.com/go-git/go-git'
+        - pattern: '^.*\.Checkout$'
+          msg: "go-git Checkout deletes .gitignored dirs - use CheckoutBranch() from git_operations.go"
+          pkg: 'github\.com/go-git/go-git'
+        - pattern: '^.*Worktree\.Status$'
+          msg: "go-git Worktree.Status() walks the whole worktree - use gitrepo.Status(ctx, repo)"
+          pkg: 'github\.com/go-git/go-git'
+        - pattern: '^.*\.(Print|Println|Printf)$'
+          msg: "cobra's Print* writes to OutOrStderr (stderr in production); use fmt.Fprint*(cmd.OutOrStdout(), ...)"
+          pkg: 'github\.com/spf13/cobra'
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    sloglint:
+      attr-only: true
+    testifylint:
+      enable-all: true
+    unparam:
+      check-exported: true
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - wrapcheck
+          - forbidigo
+      - path: ^e2e/
+        linters:
+          - errcheck
+          - gochecknoinits
+          - goconst
+          - gosec
+          - noctx
+          - revive
+          - usetesting
+          - wrapcheck
+      # Test harness that happens not to end in _test.go, so the rules above
+      # miss it. Same exemption `^e2e/` already gets for its support files.
+      - path: ^cmd/entire/cli/integration_test/
+        linters:
+          - gosec
+      - path: ^test/workloads/
+        linters:
+          - wrapcheck
+      - path: ^internal/sim/
+        linters:
+          - wrapcheck
+      # configloader.go is a thin os-backed billy.Basic adapter. It must return
+      # raw os errors unwrapped so go-git's os.IsNotExist() fall-through (for
+      # absent config files) keeps working; wrapping would break it.
+      - path: ^cmd/entire/cli/checkpoint/configloader\.go$
+        linters:
+          - wrapcheck
+      - text: "`strat` is a misspelling"
+        linters:
+          - misspell

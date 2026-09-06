@@ -1,0 +1,971 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/spf13/cobra"
+)
+
+// newTestCleanCmd creates a cobra.Command with captured stdout/stderr for testing.
+func newTestCleanCmd(t *testing.T) (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	return cmd, &stdout, &stderr
+}
+
+func setupCleanTestRepo(t *testing.T) (*git.Repository, plumbing.Hash) {
+	t.Helper()
+
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		t.Fatalf("failed to open git repo: %v", err)
+	}
+
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+
+	// Create initial commit
+	emptyTree := &object.Tree{Entries: []object.TreeEntry{}}
+	obj := repo.Storer.NewEncodedObject()
+	if err := emptyTree.Encode(obj); err != nil {
+		t.Fatalf("failed to encode empty tree: %v", err)
+	}
+	emptyTreeHash, err := repo.Storer.SetEncodedObject(obj)
+	if err != nil {
+		t.Fatalf("failed to store empty tree: %v", err)
+	}
+
+	sig := object.Signature{Name: "test", Email: "test@test.com"}
+	commit := &object.Commit{
+		TreeHash:  emptyTreeHash,
+		Author:    sig,
+		Committer: sig,
+		Message:   "initial commit",
+	}
+	commitObj := repo.Storer.NewEncodedObject()
+	if err := commit.Encode(commitObj); err != nil {
+		t.Fatalf("failed to encode commit: %v", err)
+	}
+	commitHash, err := repo.Storer.SetEncodedObject(commitObj)
+	if err != nil {
+		t.Fatalf("failed to store commit: %v", err)
+	}
+
+	// Create HEAD and master references
+	headRef := plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.NewBranchReferenceName("master"))
+	if err := repo.Storer.SetReference(headRef); err != nil {
+		t.Fatalf("failed to set HEAD: %v", err)
+	}
+	masterRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("master"), commitHash)
+	if err := repo.Storer.SetReference(masterRef); err != nil {
+		t.Fatalf("failed to set master: %v", err)
+	}
+
+	return repo, commitHash
+}
+
+// createSessionStateFile creates a session state JSON file in .git/entire-sessions/.
+func createSessionStateFile(t *testing.T, repoRoot string, sessionID string, commitHash plumbing.Hash) string {
+	t.Helper()
+
+	sessionStateDir := filepath.Join(repoRoot, ".git", "entire-sessions")
+	if err := os.MkdirAll(sessionStateDir, 0o755); err != nil {
+		t.Fatalf("failed to create session state dir: %v", err)
+	}
+
+	sessionFile := filepath.Join(sessionStateDir, sessionID+".json")
+	sessionState := map[string]any{
+		"session_id":       sessionID,
+		"base_commit":      commitHash.String(),
+		"checkpoint_count": 1,
+		"started_at":       time.Now().Format(time.RFC3339),
+	}
+	sessionData, err := json.Marshal(sessionState)
+	if err != nil {
+		t.Fatalf("failed to marshal session state: %v", err)
+	}
+	if err := os.WriteFile(sessionFile, sessionData, 0o600); err != nil {
+		t.Fatalf("failed to write session state file: %v", err)
+	}
+	return sessionFile
+}
+
+func writeCleanSettingsFile(t *testing.T, repoRoot, content string) {
+	t.Helper()
+
+	entireDir := filepath.Join(repoRoot, ".entire")
+	if err := os.MkdirAll(entireDir, 0o755); err != nil {
+		t.Fatalf("failed to create .entire directory: %v", err)
+	}
+
+	settingsFile := filepath.Join(entireDir, "settings.json")
+	if err := os.WriteFile(settingsFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write settings file: %v", err)
+	}
+}
+
+func TestCleanLongDescription_DefaultIsGeneric(t *testing.T) {
+	repo, _ := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	repoRoot := wt.Filesystem().Root()
+
+	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {}}`)
+
+	description := cleanLongDescription()
+	if strings.Contains(description, "entire/checkpoints/v1") {
+		t.Fatalf("did not expect stale v1 preservation text, got: %s", description)
+	}
+}
+
+// --- Default mode tests (current HEAD cleanup) ---
+
+func TestCleanCmd_DefaultMode_NothingToClean(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--force"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+}
+
+func TestCleanCmd_DefaultMode_WithForce(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	worktreePath := wt.Filesystem().Root()
+	worktreeID, err := paths.GetWorktreeID(worktreePath)
+	if err != nil {
+		t.Fatalf("failed to get worktree ID: %v", err)
+	}
+
+	// Create shadow branch
+	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	// Create session state file
+	sessionFile := createSessionStateFile(t, worktreePath, "2026-02-02-test123", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--force"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	// Verify shadow branch deleted
+	refName := plumbing.NewBranchReferenceName(shadowBranch)
+	if _, err := repo.Reference(refName, true); err == nil {
+		t.Error("shadow branch should be deleted")
+	}
+
+	// Verify session state file deleted
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Error("session state file should be deleted")
+	}
+}
+
+func TestCleanCmd_DefaultMode_DryRun(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	worktreePath := wt.Filesystem().Root()
+	worktreeID, err := paths.GetWorktreeID(worktreePath)
+	if err != nil {
+		t.Fatalf("failed to get worktree ID: %v", err)
+	}
+
+	// Create shadow branch
+	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	// Create session state file
+	sessionFile := createSessionStateFile(t, worktreePath, "2026-02-02-test123", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--dry-run"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Would clean") {
+		t.Errorf("Expected 'Would clean' in output, got: %s", output)
+	}
+	if !strings.Contains(output, shadowBranch) {
+		t.Errorf("Expected shadow branch name in output, got: %s", output)
+	}
+	if !strings.Contains(output, "2026-02-02-test123") {
+		t.Errorf("Expected session ID in output, got: %s", output)
+	}
+
+	// Verify nothing was deleted
+	refName := plumbing.NewBranchReferenceName(shadowBranch)
+	if _, err := repo.Reference(refName, true); err != nil {
+		t.Error("shadow branch should still exist after dry-run")
+	}
+	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
+		t.Error("session state file should still exist after dry-run")
+	}
+}
+
+func TestCleanCmd_DefaultMode_DryRun_NothingToClean(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--dry-run"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Nothing to clean") {
+		t.Errorf("Expected 'Nothing to clean' message, got: %s", output)
+	}
+}
+
+func TestCleanCmd_DefaultMode_SessionsWithoutShadowBranch(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	worktreePath := wt.Filesystem().Root()
+
+	// Create session state files WITHOUT a shadow branch
+	sessionFile := createSessionStateFile(t, worktreePath, "2026-02-02-orphaned", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--force"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	// Verify session state file deleted
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Error("session state file should be deleted even without shadow branch")
+	}
+}
+
+func TestCleanCmd_DefaultMode_MultipleSessions(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	worktreePath := wt.Filesystem().Root()
+	worktreeID, err := paths.GetWorktreeID(worktreePath)
+	if err != nil {
+		t.Fatalf("failed to get worktree ID: %v", err)
+	}
+
+	// Create shadow branch
+	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	// Create multiple session state files
+	session1File := createSessionStateFile(t, worktreePath, "2026-02-02-session1", commitHash)
+	session2File := createSessionStateFile(t, worktreePath, "2026-02-02-session2", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--force"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	// Verify both session files deleted
+	if _, err := os.Stat(session1File); !os.IsNotExist(err) {
+		t.Error("session1 file should be deleted")
+	}
+	if _, err := os.Stat(session2File); !os.IsNotExist(err) {
+		t.Error("session2 file should be deleted")
+	}
+
+	// Verify shadow branch deleted
+	refName := plumbing.NewBranchReferenceName(shadowBranch)
+	if _, err := repo.Reference(refName, true); err == nil {
+		t.Error("shadow branch should be deleted")
+	}
+}
+
+func TestCleanCmd_DefaultMode_NotGitRepo(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("clean command should return error for non-git directory")
+	}
+	if !strings.Contains(err.Error(), "not a git repository") {
+		t.Errorf("Expected 'not a git repository' error, got: %v", err)
+	}
+}
+
+// --- --all mode tests (repo-wide orphan cleanup) ---
+
+func TestCleanCmd_All_NoOrphanedItems(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "No items to clean up") {
+		t.Errorf("Expected 'No items to clean up' message, got: %s", output)
+	}
+}
+
+func TestCleanCmd_All_PreviewMode(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	// Create shadow branches
+	shadowBranches := []string{"entire/abc1234", "entire/def5678"}
+	for _, b := range shadowBranches {
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(b), commitHash)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatalf("failed to create branch %s: %v", b, err)
+		}
+	}
+
+	// Also create entire/checkpoints/v1 (should NOT be listed)
+	sessionsRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), commitHash)
+	if err := repo.Storer.SetReference(sessionsRef); err != nil {
+		t.Fatalf("failed to create %s: %v", paths.MetadataBranchName, err)
+	}
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--dry-run"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --dry-run error = %v", err)
+	}
+
+	output := stdout.String()
+
+	if !strings.Contains(output, "to clean") {
+		t.Errorf("Expected 'to clean' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "entire/abc1234") {
+		t.Errorf("Expected 'entire/abc1234' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "entire/def5678") {
+		t.Errorf("Expected 'entire/def5678' in output, got: %s", output)
+	}
+	if strings.Contains(output, paths.MetadataBranchName) {
+		t.Errorf("Should not list '%s', got: %s", paths.MetadataBranchName, output)
+	}
+	if !strings.Contains(output, "without --dry-run") {
+		t.Errorf("Expected '--dry-run' hint in output, got: %s", output)
+	}
+
+	// Branches should still exist (dry-run doesn't delete)
+	for _, b := range shadowBranches {
+		refName := plumbing.NewBranchReferenceName(b)
+		if _, err := repo.Reference(refName, true); err != nil {
+			t.Errorf("Branch %s should still exist after dry-run", b)
+		}
+	}
+}
+
+func TestCleanCmd_All_DryRun(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	shadowBranches := []string{"entire/abc1234"}
+	for _, b := range shadowBranches {
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(b), commitHash)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatalf("failed to create branch %s: %v", b, err)
+		}
+	}
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--dry-run"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --dry-run error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "to clean") {
+		t.Errorf("Expected 'to clean' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "without --dry-run") {
+		t.Errorf("Expected '--dry-run' hint in output, got: %s", output)
+	}
+
+	// Branches should still exist
+	for _, b := range shadowBranches {
+		refName := plumbing.NewBranchReferenceName(b)
+		if _, err := repo.Reference(refName, true); err != nil {
+			t.Errorf("Branch %s should still exist after dry-run", b)
+		}
+	}
+}
+
+func TestCleanCmd_All_ForceMode(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	shadowBranches := []string{"entire/abc1234", "entire/def5678"}
+	for _, b := range shadowBranches {
+		ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName(b), commitHash)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatalf("failed to create branch %s: %v", b, err)
+		}
+	}
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--force"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --force error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Deleted") {
+		t.Errorf("Expected 'Deleted' in output, got: %s", output)
+	}
+
+	// Branches should be deleted
+	for _, b := range shadowBranches {
+		refName := plumbing.NewBranchReferenceName(b)
+		if _, err := repo.Reference(refName, true); err == nil {
+			t.Errorf("Branch %s should be deleted but still exists", b)
+		}
+	}
+}
+
+func TestCleanCmd_All_SessionsBranchPreserved(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("entire/abc1234"), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	sessionsRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), commitHash)
+	if err := repo.Storer.SetReference(sessionsRef); err != nil {
+		t.Fatalf("failed to create entire/checkpoints/v1: %v", err)
+	}
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--force"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --force error = %v", err)
+	}
+
+	// Shadow branch should be deleted
+	refName := plumbing.NewBranchReferenceName("entire/abc1234")
+	if _, err := repo.Reference(refName, true); err == nil {
+		t.Error("Shadow branch should be deleted")
+	}
+
+	// Sessions branch should still exist
+	sessionsRefName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	if _, err := repo.Reference(sessionsRefName, true); err != nil {
+		t.Error("entire/checkpoints/v1 branch should be preserved")
+	}
+}
+
+func TestCleanCmd_All_NotGitRepository(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all"})
+
+	err := cmd.Execute()
+	// Should return error for non-git directory
+	if err == nil {
+		t.Error("clean --all should return error for non-git directory")
+	}
+}
+
+func TestCleanCmd_All_InvalidSettingsIgnoredWithoutV2Scan(t *testing.T) {
+	repo, _ := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	repoRoot := wt.Filesystem().Root()
+
+	writeCleanSettingsFile(t, repoRoot, `{"enabled": true,`)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--all", "--dry-run"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("clean --all --dry-run error = %v", err)
+	}
+
+	if stderr.String() != "" {
+		t.Fatalf("expected no settings warning, got stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "No items to clean up.") {
+		t.Fatalf("expected command to continue cleanup flow, got stdout=%q", stdout.String())
+	}
+}
+
+func TestCleanCmd_All_Subdirectory(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("entire/abc1234"), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	repoRoot := wt.Filesystem().Root()
+	subDir := filepath.Join(repoRoot, "subdir")
+	if err := wt.Filesystem().MkdirAll("subdir", 0o755); err != nil {
+		t.Fatalf("failed to create subdir: %v", err)
+	}
+
+	t.Chdir(subDir)
+	paths.ClearWorktreeRootCache()
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--dry-run"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --dry-run from subdirectory error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "entire/abc1234") {
+		t.Errorf("Should find shadow branches from subdirectory, got: %s", output)
+	}
+}
+
+// Regression test: --all should find sessions that have a shadow branch.
+// Previously, --all only cleaned orphaned sessions (no shadow branch AND no checkpoints),
+// so active sessions with a shadow branch were invisible to --all.
+func TestCleanCmd_All_FindsSessionWithShadowBranch(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	worktreePath := wt.Filesystem().Root()
+	worktreeID, err := paths.GetWorktreeID(worktreePath)
+	if err != nil {
+		t.Fatalf("failed to get worktree ID: %v", err)
+	}
+
+	// Create shadow branch for the session's base commit
+	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	// Create session state file — this session HAS a shadow branch,
+	// so it was NOT considered orphaned by the old --all behavior
+	sessionFile := createSessionStateFile(t, worktreePath, "2026-02-02-active-session", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--all", "--force"})
+
+	err = cmd.Execute()
+	if err != nil {
+		t.Fatalf("clean --all --force error = %v", err)
+	}
+
+	output := stdout.String()
+
+	// Session should be cleaned
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Error("session state file should be deleted by --all")
+	}
+
+	// Shadow branch should be cleaned
+	refName := plumbing.NewBranchReferenceName(shadowBranch)
+	if _, err := repo.Reference(refName, true); err == nil {
+		t.Error("shadow branch should be deleted by --all")
+	}
+
+	if !strings.Contains(output, "Deleted") {
+		t.Errorf("Expected 'Deleted' in output, got: %s", output)
+	}
+}
+
+// --- runCleanAllWithItems unit tests ---
+
+func TestRunCleanAllWithItems_PartialFailure(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+
+	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("entire/abc1234"), commitHash)
+	if err := repo.Storer.SetReference(shadowRef); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+
+	items := []strategy.CleanupItem{
+		{Type: strategy.CleanupTypeShadowBranch, ID: "entire/abc1234", Reason: "test"},
+		{Type: strategy.CleanupTypeShadowBranch, ID: "entire/nonexistent1234567", Reason: "test"},
+	}
+
+	cmd, stdout, stderr := newTestCleanCmd(t)
+	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil, nil, nil)
+
+	if err == nil {
+		t.Fatal("runCleanAllWithItems() should return error when items fail to delete")
+	}
+	if !strings.Contains(err.Error(), "failed to delete 1 item") {
+		t.Errorf("Error should mention 'failed to delete 1 item', got: %v", err)
+	}
+	// Verify singular (not "1 items")
+	if strings.Contains(err.Error(), "1 items") {
+		t.Errorf("Error should use singular 'item' for count 1, got: %v", err)
+	}
+
+	// Output should show the successful deletion with singular grammar
+	output := stdout.String()
+	if !strings.Contains(output, "✓ Deleted 1 item:") {
+		t.Errorf("Output should show '✓ Deleted 1 item:', got: %s", output)
+	}
+	// Stderr should show the failure with singular grammar
+	errOutput := stderr.String()
+	if !strings.Contains(errOutput, "Failed to delete 1 item:") {
+		t.Errorf("Stderr should show 'Failed to delete 1 item:', got: %s", errOutput)
+	}
+}
+
+func TestRunCleanAllWithItems_AllFailures(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	items := []strategy.CleanupItem{
+		{Type: strategy.CleanupTypeShadowBranch, ID: "entire/nonexistent1234567", Reason: "test"},
+		{Type: strategy.CleanupTypeShadowBranch, ID: "entire/alsononexistent", Reason: "test"},
+	}
+
+	cmd, stdout, stderr := newTestCleanCmd(t)
+	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil, nil, nil)
+
+	if err == nil {
+		t.Fatal("runCleanAllWithItems() should return error when items fail to delete")
+	}
+	if !strings.Contains(err.Error(), "failed to delete 2 items") {
+		t.Errorf("Error should mention 'failed to delete 2 items', got: %v", err)
+	}
+
+	output := stdout.String()
+	if strings.Contains(output, "✓ Deleted") {
+		t.Errorf("Output should not show successful deletions, got: %s", output)
+	}
+	// Failures are written to stderr
+	errOutput := stderr.String()
+	if !strings.Contains(errOutput, "Failed to delete 2 items:") {
+		t.Errorf("Stderr should show 'Failed to delete 2 items:', got: %s", errOutput)
+	}
+}
+
+func TestRunCleanAllWithItems_NoItems(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	cmd, stdout, _ := newTestCleanCmd(t)
+	err := runCleanAllWithItems(cmd.Context(), cmd, false, false, []strategy.CleanupItem{}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("runCleanAllWithItems() error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "No items to clean up") {
+		t.Errorf("Expected 'No items to clean up' message, got: %s", output)
+	}
+}
+
+func TestRunCleanAllWithItems_MixedTypes_Preview(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	items := []strategy.CleanupItem{
+		{Type: strategy.CleanupTypeShadowBranch, ID: "entire/abc1234", Reason: "test"},
+		{Type: strategy.CleanupTypeSessionState, ID: "session-123", Reason: "no checkpoints"},
+		{Type: strategy.CleanupTypeCheckpoint, ID: "checkpoint-abc", Reason: "orphaned"},
+	}
+
+	cmd, stdout, _ := newTestCleanCmd(t)
+	err := runCleanAllWithItems(cmd.Context(), cmd, false, true, items, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("runCleanAllWithItems() error = %v", err)
+	}
+
+	output := stdout.String()
+	if !strings.Contains(output, "Shadow branches") {
+		t.Errorf("Expected 'Shadow branches' section, got: %s", output)
+	}
+	if !strings.Contains(output, "Session states") {
+		t.Errorf("Expected 'Session states' section, got: %s", output)
+	}
+	if !strings.Contains(output, "Checkpoint metadata") {
+		t.Errorf("Expected 'Checkpoint metadata' section, got: %s", output)
+	}
+	if !strings.Contains(output, "Found 3 items to clean") {
+		t.Errorf("Expected 'Found 3 items to clean', got: %s", output)
+	}
+}
+
+// --- Flag validation tests ---
+
+func TestCleanCmd_MutuallyExclusiveFlags(t *testing.T) {
+	setupCleanTestRepo(t)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--all", "--session", "test-session"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("--all and --session should be mutually exclusive")
+	}
+	if !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("Expected mutual exclusion error, got: %v", err)
+	}
+}
+
+// --- Temp file deletion ---
+
+// TestDeleteTempFiles_ToleratesVanishedFile covers the race the OpenCode export
+// staging introduces: listAllTempFiles snapshots .entire/tmp, and a staged export
+// can be renamed into place before deleteTempFiles gets to it. A name that is
+// already gone is not a deletion failure.
+func TestDeleteTempFiles_ToleratesVanishedFile(t *testing.T) {
+	setupCleanTestRepo(t)
+	ctx := context.Background()
+
+	tmpDirAbs, err := paths.AbsPath(ctx, paths.EntireTmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tmpDirAbs, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDirAbs, "present.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, failed := deleteTempFiles(ctx, []string{"present.json", ".export-ses_x.json-42"})
+
+	if len(failed) != 0 {
+		t.Errorf("deleteTempFiles reported %d failure(s) for an already-gone file: %+v", len(failed), failed)
+	}
+	if len(deleted) != 1 || deleted[0] != "present.json" {
+		t.Errorf("deleted = %v, want [present.json]", deleted)
+	}
+}
+
+// .entire/tmp is where deleteTempFiles unlinks names it found on a previous
+// walk, so a link swapped in at the directory must be refused rather than
+// deleted through. os.Root stops only the links that leave the repository, and
+// this one does not have to.
+func TestDeleteTempFiles_RefusesASymlinkedTmpDirectory(t *testing.T) {
+	if runtime.GOOS == windowsGOOS {
+		t.Skip("symlink creation is not generally available on Windows")
+	}
+	setupCleanTestRepo(t)
+	ctx := context.Background()
+
+	entireDirAbs, err := paths.AbsPath(ctx, ".entire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(entireDirAbs, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// The victim lives inside the repository, so nothing here escapes the root.
+	victimDir := filepath.Join(entireDirAbs, "victim")
+	if err := os.MkdirAll(victimDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(victimDir, "keep.json")
+	if err := os.WriteFile(victim, []byte(`{"keep":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("victim", filepath.Join(entireDirAbs, "tmp")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	deleted, failed := deleteTempFiles(ctx, []string{"keep.json"})
+
+	if len(deleted) != 0 {
+		t.Errorf("deleted = %v, want none: the delete must not follow the link", deleted)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("failed = %+v, want exactly one refusal", failed)
+	}
+	if !errors.Is(failed[0].Err, osroot.ErrSymlinkedPath) {
+		t.Errorf("failed[0].Err = %v, want %v", failed[0].Err, osroot.ErrSymlinkedPath)
+	}
+	if _, err := os.Lstat(victim); err != nil {
+		t.Errorf("the link target must survive: %v", err)
+	}
+}
+
+// A failed listing does not abort the command, which means the summary is the
+// only place a caller learns the list was not complete. The warning goes to
+// stderr and the counts go to stdout, so stdout has to say it too.
+func TestRunCleanAllWithItems_NamesTheScansThatFailed(t *testing.T) {
+	t.Run("with nothing else to clean", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, true, false,
+			[]strategy.CleanupItem{}, nil, nil, []string{"stray agent temp files"})
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		out := stdout.String()
+		if !strings.Contains(out, "No items to clean up.") {
+			t.Errorf("stdout should still report what was found, got:\n%s", out)
+		}
+		if !strings.Contains(out, "Could not scan stray agent temp files") {
+			t.Errorf("stdout should name the failed scan, got:\n%s", out)
+		}
+	})
+
+	t.Run("in the preview", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, false, true,
+			[]strategy.CleanupItem{}, []string{"a.json"}, nil,
+			[]string{"temp files", "stray agent temp files"})
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		out := stdout.String()
+		if !strings.Contains(out, "Could not scan temp files or stray agent temp files") {
+			t.Errorf("preview should name both failed scans, got:\n%s", out)
+		}
+	})
+
+	t.Run("and stays quiet when every scan worked", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, true, false,
+			[]strategy.CleanupItem{}, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		if strings.Contains(stdout.String(), "Could not scan") {
+			t.Errorf("a complete scan must not print the note, got:\n%s", stdout.String())
+		}
+	})
+}

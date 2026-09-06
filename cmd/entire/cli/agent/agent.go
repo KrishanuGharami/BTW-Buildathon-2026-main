@@ -1,0 +1,590 @@
+// Package agent provides interfaces and types for integrating with coding agents.
+// It abstracts agent-specific behavior (hooks, log parsing, session storage) so that
+// the same Strategy implementations can work with any coding agent.
+package agent
+
+import (
+	"context"
+	"io"
+	"os/exec"
+	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+)
+
+// Agent defines the interface for interacting with a coding agent.
+// Each agent implementation (Claude Code, Cursor, Aider, etc.) converts its
+// native format to the normalized types defined in this package.
+//
+// The interface is organized into three groups:
+//   - Identity (5 methods): Name, Type, Description, DetectPresence, ProtectedDirs
+//   - Transcript Storage (3 methods): ReadTranscript, ChunkTranscript, ReassembleTranscript
+//   - Legacy (6 methods): Will be moved to optional interfaces or removed in a future phase
+type Agent interface {
+	// --- Identity ---
+
+	// Name returns the agent registry key (e.g., "claude-code", "gemini")
+	Name() types.AgentName
+
+	// Type returns the agent type identifier (e.g., "Claude Code", "Gemini CLI")
+	// This is stored in metadata and trailers.
+	Type() types.AgentType
+
+	// Description returns a human-readable description for UI
+	Description() string
+
+	// IsPreview returns whether the agent integration is in preview or stable
+	IsPreview() bool
+
+	// DetectPresence checks if this agent is configured in the repository
+	DetectPresence(ctx context.Context) (bool, error)
+
+	// ProtectedDirs returns repo-root-relative directories that Entire must never
+	// record as session changes or capture into a checkpoint.
+	// Examples: [".claude"] for Claude, [".gemini"] for Gemini.
+	ProtectedDirs() []string
+
+	// --- Transcript Storage ---
+
+	// ReadTranscript reads the raw transcript bytes for a session.
+	ReadTranscript(sessionRef string) ([]byte, error)
+
+	// ChunkTranscript splits a transcript into chunks if it exceeds maxSize.
+	// Returns a slice of chunks. If the transcript fits in one chunk, returns single-element slice.
+	// The chunking is format-aware: JSONL splits at line boundaries, JSON splits message arrays.
+	ChunkTranscript(ctx context.Context, content []byte, maxSize int) ([][]byte, error)
+
+	// ReassembleTranscript combines chunks back into a single transcript.
+	// Handles format-specific reassembly (JSONL concatenation, JSON message merging).
+	ReassembleTranscript(chunks [][]byte) ([]byte, error)
+
+	// --- Legacy methods (will move to optional interfaces in Phase 4) ---
+
+	// GetSessionID extracts session ID from hook input.
+	GetSessionID(input *HookInput) string
+
+	// GetSessionDir returns where agent stores session data for this repo.
+	GetSessionDir(repoPath string) (string, error)
+
+	// ResolveSessionFile returns the path to the session transcript file.
+	//
+	// SECURITY CONTRACT: agentSessionID is used to build a filesystem path and
+	// some implementations use it as a directory component or (Codex/Pi) return
+	// it verbatim when absolute. Callers that source agentSessionID from
+	// untrusted data (e.g. checkpoint metadata on the shared
+	// entire/checkpoints/v1 branch, hook input) MUST validate it with
+	// validation.ValidateSessionID first. The resume/log-restore paths do
+	// this at their choke points (transcript.resolveTranscriptPath and
+	// strategy.RestoreLogsOnly); do not call this with unvalidated input.
+	ResolveSessionFile(sessionDir, agentSessionID string) string
+
+	// ReadSession reads session data from agent's storage.
+	ReadSession(input *HookInput) (*AgentSession, error)
+
+	// WriteSession writes session data for resumption.
+	WriteSession(ctx context.Context, session *AgentSession) error
+
+	// FormatResumeCommand returns command to resume a session.
+	FormatResumeCommand(sessionID string) string
+}
+
+// HookSupport is implemented by agents with lifecycle hooks.
+// This optional interface allows agents like Claude Code and Cursor to
+// install and manage hooks that notify Entire of agent events.
+//
+// The interface is organized into two groups:
+//   - Hook Mapping (2 methods): HookNames, ParseHookEvent
+//   - Hook Management (3 methods): InstallHooks, UninstallHooks, AreHooksInstalled
+type HookSupport interface {
+	Agent
+
+	// HookNames returns the hook verbs this agent supports.
+	// These become subcommands under `entire hooks <agent>`.
+	// e.g., ["stop", "user-prompt-submit", "session-start", "session-end"]
+	HookNames() []string
+
+	// ParseHookEvent translates an agent-native hook into a normalized lifecycle Event.
+	// Returns nil if the hook has no lifecycle significance (e.g., pass-through hooks).
+	// This is the core contribution surface for new agent implementations.
+	ParseHookEvent(ctx context.Context, hookName string, stdin io.Reader) (*Event, error)
+
+	// InstallHooks installs agent-specific hooks.
+	// If force is true, removes existing Entire hooks before installing.
+	// Returns the number of hooks installed.
+	//
+	// Installed hook commands must always name the "entire" binary, never a
+	// path derived from repository content. Implementations recognize the
+	// legacy local-dev command shapes (see LegacyLocalDevHookScript) only so
+	// they can replace them.
+	InstallHooks(ctx context.Context, force bool) (int, error)
+
+	// UninstallHooks removes installed hooks
+	UninstallHooks(ctx context.Context) error
+
+	// AreHooksInstalled reports whether hooks are currently installed, and
+	// returns an error when the agent could not find out.
+	//
+	// The two are different answers and callers may act on the difference: "no
+	// hooks" means there is nothing to remove, while an error means the state is
+	// unknown and hooks may well be installed. Built-in agents read a local
+	// config file, where absent means absent, so they report no error. An
+	// external agent answers over a subprocess that can crash, time out, or
+	// print junk, and reports that as an error rather than as "no hooks".
+	AreHooksInstalled(ctx context.Context) (bool, error)
+}
+
+// HookConfigState describes how an agent's installed Entire hook config
+// compares to what InstallHooks would write today.
+type HookConfigState int
+
+const (
+	// HooksAbsent means Entire hooks are not installed for this agent here.
+	HooksAbsent HookConfigState = iota
+	// HooksCurrent means the installed hooks match what would be written today.
+	HooksCurrent
+	// HooksOutdated means Entire hooks are installed but stale — an older CLI
+	// wrote a config that no longer matches the current one. Fix:
+	// `entire enable --force`.
+	HooksOutdated
+)
+
+// HookFreshness is implemented by hook-supporting agents that can report
+// whether their installed config has drifted from the current one.
+//
+// AreHooksInstalled answers "is Entire wired up here at all?" — for agents
+// whose hook config is a generated file checked into the repo, that stays true
+// forever even after the generated content goes stale, because the file is
+// still present and still recognisably Entire's. CheckHookConfig answers the
+// separate question "is what's installed still what we'd write today?", so
+// `entire status` and `entire doctor` can flag a stale config instead of
+// reporting it healthy while its hooks silently no-op.
+//
+// Implementations must be read-only: they are diagnostics and must never
+// modify the agent's config.
+type HookFreshness interface {
+	Agent
+
+	// CheckHookConfig reports whether this agent's Entire hook config is
+	// absent, current, or outdated in the current repo.
+	CheckHookConfig(ctx context.Context) HookConfigState
+}
+
+// EffectiveHookDiagnostics marks agents whose effective hook state is reported
+// by an agent-owned diagnostic surface rather than generic freshness output.
+type EffectiveHookDiagnostics interface {
+	Agent
+	OwnsEffectiveHookDiagnostics()
+}
+
+// FileWatcher is implemented by agents that use file-based detection.
+// Agents like Aider that don't support hooks can use file watching
+// to detect session activity.
+type FileWatcher interface {
+	Agent
+
+	// GetWatchPaths returns paths to watch for session changes
+	GetWatchPaths() ([]string, error)
+
+	// OnFileChange handles a detected file change and returns session info
+	OnFileChange(path string) (*SessionChange, error)
+}
+
+// ProtectedFilesProvider is implemented by agents that need to exclude
+// repo-root-relative files owned by the agent integration itself from session
+// tracking or destructive operations.
+type ProtectedFilesProvider interface {
+	Agent
+
+	// ProtectedFiles returns repo-root-relative files that belong to the
+	// agent's own config/state and should be excluded from tracking.
+	ProtectedFiles() []string
+}
+
+// TranscriptAnalyzer provides format-specific transcript parsing.
+// Agents that implement this get richer checkpoints (transcript-derived file lists,
+// prompts, summaries). Agents that don't still participate in the checkpoint lifecycle
+// via git-status-based file detection and raw transcript storage.
+type TranscriptAnalyzer interface {
+	Agent
+
+	// GetTranscriptPosition returns the current position (length) of a transcript.
+	// For JSONL formats (Claude Code), this is the line count.
+	// For JSON formats (Gemini CLI), this is the message count.
+	// Returns 0 if the file doesn't exist or is empty.
+	GetTranscriptPosition(path string) (int, error)
+
+	// ExtractModifiedFilesFromOffset extracts files modified since a given offset.
+	// For JSONL formats (Claude Code), offset is the starting line number.
+	// For JSON formats (Gemini CLI), offset is the starting message index.
+	// Returns:
+	//   - files: list of file paths modified by the agent (from Write/Edit tools)
+	//   - currentPosition: the current position (line count or message count)
+	//   - error: any error encountered during reading
+	ExtractModifiedFilesFromOffset(path string, startOffset int) (files []string, currentPosition int, err error)
+}
+
+// PromptExtractor extracts user prompts from a transcript file.
+// Used as a fallback when prompt data isn't captured via hooks (e.g., Factory AI
+// Droid's exec mode doesn't fire UserPromptSubmit).
+type PromptExtractor interface {
+	Agent
+
+	// ExtractPrompts returns user prompts from the transcript starting at the given offset.
+	ExtractPrompts(sessionRef string, fromOffset int) ([]string, error)
+}
+
+// TranscriptPreparer is called before ReadTranscript to handle agent-specific
+// flush/sync requirements (e.g., Claude Code's async transcript writing).
+// The framework calls PrepareTranscript before ReadTranscript if implemented.
+type TranscriptPreparer interface {
+	Agent
+
+	// PrepareTranscript ensures the transcript is ready to read.
+	// For Claude Code, this waits for the async transcript flush to complete.
+	PrepareTranscript(ctx context.Context, sessionRef string) error
+}
+
+// TranscriptFetcher is implemented by agents that can materialize a session
+// transcript on demand (e.g. OpenCode via `opencode export`), including for
+// sessions Entire never tracked — where no hook-cached transcript file exists
+// (e.g. sessions spawned by an external host rather than a hooked terminal).
+// TranscriptPreparer, by contrast, only refreshes an already-existing file.
+type TranscriptFetcher interface {
+	Agent
+
+	// FetchTranscript writes the session's transcript to the agent's cache
+	// location and returns its path. Errors may be shown to users after other
+	// transcript sources fail, so they must be concise and safe to display.
+	FetchTranscript(ctx context.Context, sessionID string) (string, error)
+}
+
+// SidecarImageProvider is implemented by agents that keep images OUTSIDE the
+// transcript Entire condenses — e.g. Cursor stores pasted images in a per-session
+// SQLite blob store, not the JSONL transcript. The strategy layer calls this
+// during condensation/finalize to capture those images as checkpoint assets so
+// they're preserved with the session. Best-effort: returns nil (no error) when
+// the sidecar store is unavailable or unreadable.
+type SidecarImageProvider interface {
+	Agent
+
+	// SidecarImages returns images stored outside the transcript for the session
+	// identified by sessionRef (the transcript path).
+	SidecarImages(ctx context.Context, sessionRef string) ([]CompactedTranscriptAsset, error)
+}
+
+// TranscriptSanitizer is implemented by agents whose native transcript format
+// carries state that Entire must not keep in its own copy — e.g. Codex rollouts
+// embed encrypted reasoning payloads and compaction blobs that are bound to the
+// originating session and cannot be replayed out of a checkpoint.
+//
+// Entire always leaves the agent's own transcript untouched; this transform applies
+// only to the copy Entire stores. Sanitizing before redaction is what keeps
+// non-replayable payloads out of storage AND keeps the redaction layers from
+// scanning megabytes of ciphertext they would only discard afterwards (base64 is
+// the pathological input for the entropy layer).
+//
+// Implementations must be pure byte transforms: idempotent (sanitizing an
+// already-sanitized transcript is a no-op), safe to call from hooks, and never
+// dependent on the agent process being alive.
+type TranscriptSanitizer interface {
+	Agent
+
+	// SanitizeTranscriptForStorage returns the transcript with non-portable state
+	// removed. It must return the input unchanged rather than nil when it cannot
+	// parse the transcript, so a sanitizer failure never loses the session.
+	SanitizeTranscriptForStorage(data []byte) []byte
+}
+
+// TokenCalculator provides token usage calculation for a session.
+// The framework calls this during step save and checkpoint if implemented.
+type TokenCalculator interface {
+	Agent
+
+	// CalculateTokenUsage computes token usage from the transcript starting at the given offset.
+	CalculateTokenUsage(transcriptData []byte, fromOffset int) (*TokenUsage, error)
+}
+
+// ModelExtractor extracts the LLM model identifier from a transcript for agents
+// that do not report the model through lifecycle hooks. Pi, for example, records
+// the model on every assistant message (message.model) but its hook events carry
+// no model field, so the transcript is the only source. The framework calls this
+// during condensation to backfill session state when the model is otherwise
+// unknown.
+type ModelExtractor interface {
+	Agent
+
+	// ExtractModel returns the model identifier from the transcript (e.g.
+	// "gpt-5.5"), or "" if none can be determined.
+	ExtractModel(transcriptData []byte) (string, error)
+}
+
+// TextGenerator is an optional interface for agents whose CLI supports
+// non-interactive text generation (e.g., claude --print).
+// Used for AI-powered metadata generation (trail titles, summaries).
+type TextGenerator interface {
+	Agent
+
+	// GenerateText sends a prompt to the agent's CLI and returns the raw text response.
+	// model is a hint (e.g., "haiku", "sonnet"). Implementations may ignore if not applicable.
+	GenerateText(ctx context.Context, prompt string, model string) (string, error)
+}
+
+// ProgressPhase identifies a coarse stage in streaming text generation.
+type ProgressPhase string
+
+const (
+	// PhaseConnecting is emitted once when the CLI signals it is making the upstream request.
+	PhaseConnecting ProgressPhase = "connecting"
+	// PhaseFirstToken is emitted once when the upstream responds with the first event,
+	// carrying TTFT and input/cache token counts.
+	PhaseFirstToken ProgressPhase = "first-token"
+	// PhaseGenerating is emitted repeatedly as text or thinking deltas arrive.
+	// OutputTokens carries a running estimate based on delta sizes.
+	PhaseGenerating ProgressPhase = "generating"
+	// PhaseDone is emitted once when the final result event is received without error.
+	PhaseDone ProgressPhase = "done"
+)
+
+// GenerationProgress reports a snapshot of streaming text generation progress.
+// Fields not relevant to the current Phase may be zero-valued.
+type GenerationProgress struct {
+	Phase             ProgressPhase
+	OutputTokens      int // running estimate during PhaseGenerating; final at PhaseDone
+	InputTokens       int // populated at PhaseFirstToken
+	CachedInputTokens int // populated at PhaseFirstToken
+	TTFTms            int // time-to-first-token, populated at PhaseFirstToken
+	DurationMs        int // populated at PhaseDone (final result event)
+}
+
+// ProgressFn receives streaming progress updates. It must not block — invoke it
+// from the same goroutine that reads the stream and keep handlers fast.
+type ProgressFn func(GenerationProgress)
+
+// StreamingTextGenerator is an optional interface for text generators whose
+// underlying CLI exposes a streaming output mode. Callers can use AsStreamingTextGenerator
+// to detect support and fall back to plain GenerateText when unavailable.
+type StreamingTextGenerator interface {
+	Agent
+
+	// GenerateTextStreaming invokes the agent's streaming text generation and
+	// calls progress for each phase update. progress may be nil to suppress
+	// reporting. The returned string is the final response text.
+	GenerateTextStreaming(ctx context.Context, prompt, model string, progress ProgressFn) (string, error)
+}
+
+// CompactedTranscript contains the result of transcript compaction into Entire
+// Transcript Format. Assets are accepted in the protocol shape for forward
+// compatibility but may not yet be persisted by all call sites.
+type CompactedTranscript struct {
+	Transcript []byte
+	Assets     []CompactedTranscriptAsset
+}
+
+// CompactedTranscriptAsset is binary data extracted during transcript compaction.
+type CompactedTranscriptAsset struct {
+	Name      string
+	MediaType string
+	Data      []byte
+}
+
+// TranscriptCompactor is implemented by agents that can produce Entire
+// Transcript Format directly from their native transcript representation.
+type TranscriptCompactor interface {
+	Agent
+
+	// CompactTranscript converts the transcript referenced by sessionRef into
+	// Entire Transcript Format and returns the compact transcript bytes.
+	CompactTranscript(ctx context.Context, sessionRef string) (*CompactedTranscript, error)
+}
+
+// HookResponseWriter is implemented by agents that support structured hook responses.
+// Agents that implement this can output messages (e.g., banners) to the user via
+// the agent's response protocol. For example, Claude Code outputs JSON with a
+// systemMessage field to stdout. Agents that don't implement this will silently
+// skip hook response output.
+type HookResponseWriter interface {
+	Agent
+
+	// WriteHookResponse outputs a message to the user via the agent's hook response protocol.
+	WriteHookResponse(message string) error
+}
+
+// SessionEndBudgeter is implemented by agents whose host enforces a hard
+// wall-clock budget on the session-end hook, because it runs inside the agent's
+// own shutdown sequence rather than between turns.
+//
+// Codex is the motivating case: it defaults SessionEnd handlers to a 1s timeout
+// and clamps any configured value to 3s (SESSION_END_MAX_TIMEOUT_SEC in
+// codex-rs/hooks/src/events/session_end.rs), keeping teardown inside
+// app-server's five-second shutdown bound. On expiry it terminates the hook's
+// entire process tree.
+//
+// Declaring a budget makes Entire stop itself just short of that ceiling rather
+// than being killed mid-write: the session is marked ENDED first (a single
+// atomic state-file rename), and only the eager condense — which is fail-open
+// — runs against the remaining budget. PostCommit handles sessions with pending
+// files; doctor retries no-file ENDED sessions. Agents whose session-end hook
+// has a normal timeout should not implement this.
+type SessionEndBudgeter interface {
+	Agent
+
+	// SessionEndBudget returns the wall-clock budget for the whole session-end
+	// hook invocation, measured from process start. A non-positive value means
+	// no budget applies.
+	SessionEndBudget() time.Duration
+}
+
+// RestoredSessionPathResolver is implemented by agents that need a
+// transcript-specific path when Entire reconstructs a session from checkpoint
+// metadata. This is used for restored sessions only; live sessions still use
+// the agent's native hook/session references.
+type RestoredSessionPathResolver interface {
+	Agent
+
+	// ResolveRestoredSessionFile returns where Entire should write a restored
+	// transcript so the agent can discover it later.
+	ResolveRestoredSessionFile(sessionDir, agentSessionID string, transcript []byte) (string, error)
+}
+
+// TestOnly is implemented by agents that exist solely for testing (e.g., the Vogon canary agent).
+// These agents are excluded from the user-facing agent selection in `entire enable`.
+type TestOnly interface {
+	Agent
+	IsTestOnly() bool
+}
+
+// Launcher is implemented by agents that `entire` can subprocess-spawn.
+// This is used by `entire review` to start an agent with a pre-composed
+// initial prompt; other commands may use it later.
+//
+// Contract:
+//   - LaunchCmd builds an *exec.Cmd with stdin/stdout/stderr wired to the
+//     caller's TTY. The agent runs in the foreground and the call blocks.
+//   - The returned cmd is ready to Run() or Start(); it must NOT be modified
+//     by the caller except to set environment variables or working dir.
+//   - initialPrompt is the first user message to send to the agent.
+type Launcher interface {
+	LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error)
+}
+
+// DiscoveredSkill describes one review-adjacent skill found on disk by a
+// SkillDiscoverer. Name is the agent-native invocation form (e.g. a
+// slash-prefixed command); Description is scraped from on-disk metadata
+// if available; SourcePath is kept for debug logging and is not shown to
+// the user.
+type DiscoveredSkill struct {
+	Name        string
+	Description string
+	SourcePath  string
+}
+
+// SkillDiscoverer is implemented by agents that can enumerate review-adjacent
+// skills installed locally on disk (e.g. plugin skills under
+// ~/.claude/plugins/...). This powers the "Installed plugin skills" section
+// of the `entire review` picker and the runtime verification that configured
+// skills still exist before spawn.
+//
+// Contract:
+//   - Safe to call on fresh installs where no plugin dir exists yet —
+//     return (nil, nil), not an error.
+//   - Malformed individual skill metadata must be skipped with a Debug log,
+//     not propagated as an error.
+//   - A (nil, non-nil) error means "discovery could not run at all" (e.g.
+//     home dir inaccessible). Callers may treat all errors as "found nothing"
+//     and log at Debug — discovery must never block the picker.
+type SkillDiscoverer interface {
+	Agent
+	DiscoverReviewSkills(ctx context.Context) ([]DiscoveredSkill, error)
+}
+
+// SessionBaseDirProvider is implemented by agents that store transcripts in a
+// home-directory-based structure with per-project subdirectories. This enables
+// cross-project transcript search (e.g., when a session was started from a
+// different working directory). Agents with ephemeral/temp-based storage or
+// flat session layouts should NOT implement this interface.
+type SessionBaseDirProvider interface {
+	Agent
+
+	// GetSessionBaseDir returns the base directory containing per-project
+	// session subdirectories (e.g., ~/.claude/projects, ~/.gemini/tmp).
+	GetSessionBaseDir() (string, error)
+}
+
+// SubagentSessionLink identifies the parent task invocation that spawned a
+// subagent session. It is resolved from the subagent's own transcript, so it
+// stays valid regardless of when the parent's tool hooks fire.
+type SubagentSessionLink struct {
+	// ParentSessionID is the session that invoked the task tool.
+	ParentSessionID string
+
+	// ToolUseID is the parent's tool-use ID for this invocation. It keys the
+	// task checkpoint's metadata directory, so it must be stable across hooks.
+	ToolUseID string
+
+	// ParentTranscriptPath locates the parent session's transcript, which the
+	// task checkpoint stores alongside the subagent's own. Empty when the agent
+	// cannot resolve it; the checkpoint is then written without it.
+	ParentTranscriptPath string
+
+	// SubagentType is the kind of subagent (e.g. "worker"); may be empty.
+	SubagentType string
+
+	// TaskDescription is a short human-readable task label; may be empty.
+	TaskDescription string
+}
+
+// SubagentSessionResolver is implemented by agents that run subagents as
+// full sessions of their own — with their own SessionStart/UserPromptSubmit/Stop
+// hooks — rather than as a blocking tool call inside the parent's turn.
+//
+// For such agents the parent's post-tool hook cannot delimit the subagent's
+// work: it fires when the task is *dispatched*, not when it completes, so the
+// worktree is still untouched at that point. Turn-end consults this instead, to
+// recognize a subagent session and attribute its work to the parent as a task
+// checkpoint rather than minting an unrelated top-level session checkpoint.
+//
+// Agents whose subagents block the parent turn (Claude Code's Task tool) must
+// NOT implement this — their SubagentEnd path already bounds the work correctly.
+type SubagentSessionResolver interface {
+	Agent
+
+	// ResolveSubagentSession reports whether the session behind sessionRef was
+	// spawned by a parent task invocation, and if so identifies the parent.
+	// Returns false for ordinary top-level sessions and whenever the link
+	// cannot be read — callers treat a failure as "not a subagent session".
+	ResolveSubagentSession(sessionRef string) (SubagentSessionLink, bool)
+}
+
+// SubagentAwareExtractor provides methods for extracting files and tokens including subagents.
+// Agents that support spawning subagents (like Claude Code's Task tool) should implement this
+// to ensure subagent contributions are included in checkpoints.
+type SubagentAwareExtractor interface {
+	Agent
+
+	// ExtractAllModifiedFiles extracts files modified by both the main agent and any spawned subagents.
+	// The subagentsDir parameter specifies where subagent transcripts are stored.
+	// Returns a deduplicated list of all modified file paths.
+	ExtractAllModifiedFiles(transcriptData []byte, fromOffset int, subagentsDir string) ([]string, error)
+
+	// CalculateTotalTokenUsage computes token usage including all spawned subagents.
+	// The subagentsDir parameter specifies where subagent transcripts are stored
+	// (an empty subagentsDir skips subagent accounting and leaves SubagentTokens nil).
+	//
+	// CONTRACT — the returned SubagentTokens is a CUMULATIVE-SINCE-SESSION-START
+	// snapshot, NOT a delta scoped to fromOffset like the main-agent fields
+	// (InputTokens/OutputTokens/...). Implementations MUST discover spawned agent
+	// IDs from the FULL transcript prefix [0,end) — so a subagent spawned before
+	// fromOffset is still found (#329) — and re-read each subagent transcript from
+	// line 0 on every call. Consequently a subagent's full total repeats on every
+	// call after it is first discovered.
+	//
+	// Callers that accumulate across checkpoints/turns therefore MUST NOT sum
+	// SubagentTokens across calls: replace the running total with the latest
+	// snapshot, and rescope any window delta by subtracting a previously captured
+	// baseline (see accumulateTokenUsage / resetCheckpointWindow and
+	// session.State.SubagentTokensBaseline in cmd/entire/cli/strategy, and
+	// rescopeSubagentTokensToDeltas in cmd/entire/cli/agentimport for the import
+	// path). An implementation that instead returned per-window deltas would
+	// silently break that accounting with no compile-time or test signal.
+	CalculateTotalTokenUsage(transcriptData []byte, fromOffset int, subagentsDir string) (*TokenUsage, error)
+}

@@ -1,0 +1,158 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
+)
+
+// TestSubdirectory_EntireDirCreatedAtRepoRoot verifies that when the CLI is run
+// from a subdirectory within a git repo, the .entire directory and its contents
+// are created at the repository root, not in the subdirectory.
+//
+// This is a regression test for a bug where running Claude from frontend/ would
+// create frontend/.entire/ instead of using the repo root's .entire/.
+func TestSubdirectory_EntireDirCreatedAtRepoRoot(t *testing.T) {
+	t.Parallel()
+	env := NewRepoWithCommit(t)
+	// Create a subdirectory to simulate running from frontend/
+	subdirName := "frontend"
+	subdirPath := filepath.Join(env.RepoDir, subdirName)
+	if err := os.MkdirAll(subdirPath, 0o755); err != nil {
+		t.Fatalf("failed to create subdirectory: %v", err)
+	}
+
+	// Run the user-prompt-submit hook FROM the subdirectory
+	sessionID := "test-subdir-session"
+	input := map[string]string{
+		"session_id":      sessionID,
+		"transcript_path": "",
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("failed to marshal input: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), getTestBinary(), "hooks", agentClaudeCode, "user-prompt-submit")
+	cmd.Dir = subdirPath // Run from subdirectory!
+	cmd.Stdin = bytes.NewReader(inputJSON)
+	cmd.Env = append(testutil.GitIsolatedEnv(),
+		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hook failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify .entire/tmp was NOT created in the subdirectory
+	subdirEntire := filepath.Join(subdirPath, ".entire")
+	if _, err := os.Stat(subdirEntire); !os.IsNotExist(err) {
+		t.Errorf(".entire directory should NOT exist in subdirectory %s, but it does", subdirName)
+	}
+
+	// Verify .entire/tmp WAS created at the repo root
+	rootEntireTmp := filepath.Join(env.RepoDir, ".entire", "tmp")
+	if _, err := os.Stat(rootEntireTmp); os.IsNotExist(err) {
+		t.Errorf(".entire/tmp should exist at repo root, but it doesn't")
+	}
+
+	// Verify the pre-prompt state file was created at repo root
+	stateFile := filepath.Join(env.RepoDir, ".entire", "tmp", "pre-prompt-"+sessionID+".json")
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		t.Errorf("pre-prompt state file should exist at %s, but it doesn't", stateFile)
+	}
+
+	// Also verify the state file was NOT created in the subdirectory
+	subdirStateFile := filepath.Join(subdirPath, ".entire", "tmp", "pre-prompt-"+sessionID+".json")
+	if _, err := os.Stat(subdirStateFile); !os.IsNotExist(err) {
+		t.Errorf("pre-prompt state file should NOT exist in subdirectory at %s", subdirStateFile)
+	}
+}
+
+// TestSubdirectory_SaveStepFromSubdir verifies that SaveStep (stop hook)
+// works correctly when run from a subdirectory.
+func TestSubdirectory_SaveStepFromSubdir(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	// Create a subdirectory
+	subdirName := "src"
+	subdirPath := filepath.Join(env.RepoDir, subdirName)
+	if err := os.MkdirAll(subdirPath, 0o755); err != nil {
+		t.Fatalf("failed to create subdirectory: %v", err)
+	}
+
+	// Create a session and files
+	session := env.NewSession()
+
+	// Create a file in the subdirectory (as if Claude wrote it there)
+	env.WriteFile(filepath.Join(subdirName, "app.js"), "console.log('hello');")
+
+	// Create transcript
+	session.CreateTranscript("Create app.js", []FileChange{
+		{Path: filepath.Join(subdirName, "app.js"), Content: "console.log('hello');"},
+	})
+
+	// Simulate user-prompt-submit FROM subdirectory
+	input := map[string]string{
+		"session_id":      session.ID,
+		"transcript_path": "",
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("failed to marshal input: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), getTestBinary(), "hooks", agentClaudeCode, "user-prompt-submit")
+	cmd.Dir = subdirPath // Run from subdirectory
+	cmd.Stdin = bytes.NewReader(inputJSON)
+	cmd.Env = append(testutil.GitIsolatedEnv(),
+		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("user-prompt-submit hook failed: %v\nOutput: %s", err, output)
+	}
+
+	// Simulate stop FROM subdirectory
+	stopInput := map[string]string{
+		"session_id":      session.ID,
+		"transcript_path": session.TranscriptPath,
+	}
+	stopInputJSON, err := json.Marshal(stopInput)
+	if err != nil {
+		t.Fatalf("failed to marshal stop input: %v", err)
+	}
+
+	stopCmd := exec.CommandContext(t.Context(), getTestBinary(), "hooks", agentClaudeCode, "stop")
+	stopCmd.Dir = subdirPath // Run from subdirectory
+	stopCmd.Stdin = bytes.NewReader(stopInputJSON)
+	stopCmd.Env = append(testutil.GitIsolatedEnv(),
+		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
+	)
+	if output, err := stopCmd.CombinedOutput(); err != nil {
+		t.Fatalf("stop hook failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify .entire was NOT created in subdirectory
+	subdirEntire := filepath.Join(subdirPath, ".entire")
+	if _, err := os.Stat(subdirEntire); !os.IsNotExist(err) {
+		t.Errorf(".entire directory should NOT exist in subdirectory %s", subdirName)
+	}
+
+	// Verify the checkpoint was saved on the shadow branch, including the
+	// subdirectory file (paths must be repo-root-relative, not cwd-relative)
+	shadowBranch := env.GetShadowBranchName()
+	if !env.BranchExists(shadowBranch) {
+		t.Fatalf("shadow branch %s should exist after save", shadowBranch)
+	}
+	if !env.FileExistsInBranch(shadowBranch, subdirName+"/app.js") {
+		t.Errorf("%s/app.js should be captured on shadow branch %s", subdirName, shadowBranch)
+	}
+}

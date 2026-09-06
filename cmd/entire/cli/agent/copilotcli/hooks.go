@@ -1,0 +1,363 @@
+package copilotcli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+)
+
+// HooksFileName is the hooks file managed by Entire for Copilot CLI.
+const HooksFileName = "entire.json"
+
+// hooksDir is the directory within the repo where Copilot CLI looks for hook configs.
+const hooksDir = ".github/hooks"
+
+// hookConfigKey maps our kebab-case hook names to camelCase JSON keys.
+var hookConfigKey = map[string]string{
+	HookNameUserPromptSubmitted: "userPromptSubmitted",
+	HookNameSessionStart:        "sessionStart",
+	HookNameAgentStop:           "agentStop",
+	HookNameSessionEnd:          "sessionEnd",
+	HookNameSubagentStop:        "subagentStop",
+	HookNamePreToolUse:          "preToolUse",
+	HookNamePostToolUse:         "postToolUse",
+	HookNameErrorOccurred:       "errorOccurred",
+}
+
+// copilotHookConfig returns .github/hooks/entire.json for the current worktree,
+// opened through the worktree's root. That directory lives in the working tree,
+// which arrives by clone, so a checked-in symlink at `.github` or
+// `.github/hooks` must not be something Entire creates directories under and
+// writes through. See agent.HookConfigFile.
+func copilotHookConfig(ctx context.Context) (*agent.HookConfigFile, error) {
+	worktreeRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		// Not a repository (tests, and `enable` before `git init`): the process
+		// directory is the only candidate, and it is a directory the caller
+		// chose rather than one derived from anything read off disk.
+		worktreeRoot = "."
+	}
+	return agent.OpenHookConfig(worktreeRoot, (&CopilotCLIAgent{}).HookConfigRelPath()) //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+}
+
+// InstallHooks installs Copilot CLI hooks in .github/hooks/entire.json.
+// If force is true, removes existing Entire hooks before installing.
+// Returns the number of hooks installed.
+// Unknown top-level fields and hook types are preserved on round-trip.
+func (c *CopilotCLIAgent) InstallHooks(ctx context.Context, force bool) (int, error) {
+	cfg, err := copilotHookConfig(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	// Use raw maps to preserve unknown fields on round-trip
+	var rawFile map[string]json.RawMessage
+	var rawHooks map[string]json.RawMessage
+
+	existingData, readErr := cfg.Read()
+	switch {
+	case readErr == nil:
+		if err := json.Unmarshal(existingData, &rawFile); err != nil {
+			return 0, fmt.Errorf("failed to parse existing %s: %w", HooksFileName, err)
+		}
+		if hooksRaw, ok := rawFile["hooks"]; ok {
+			if err := json.Unmarshal(hooksRaw, &rawHooks); err != nil {
+				return 0, fmt.Errorf("failed to parse hooks in %s: %w", HooksFileName, err)
+			}
+		}
+		if _, ok := rawFile["version"]; !ok {
+			rawFile["version"] = json.RawMessage(`1`)
+		}
+	case errors.Is(readErr, os.ErrNotExist):
+		rawFile = map[string]json.RawMessage{
+			"version": json.RawMessage(`1`),
+		}
+	default:
+		return 0, fmt.Errorf("failed to read %s: %w", HooksFileName, readErr)
+	}
+
+	if rawHooks == nil {
+		rawHooks = make(map[string]json.RawMessage)
+	}
+
+	// Parse existing entries for each hook type we manage
+	hookEntries := make(map[string][]CopilotHookEntry)
+	for _, hookName := range c.HookNames() {
+		key := hookConfigKey[hookName]
+		var entries []CopilotHookEntry
+		if err := parseCopilotHookType(rawHooks, key, &entries); err != nil {
+			return 0, fmt.Errorf("failed to parse %s hooks: %w", key, err)
+		}
+		hookEntries[hookName] = entries
+	}
+
+	// If force, remove existing Entire hooks first
+	if force {
+		for hookName, entries := range hookEntries {
+			hookEntries[hookName] = removeEntireHooks(entries)
+		}
+	}
+
+	// Define command prefix
+	const cmdPrefix = "entire hooks copilot-cli "
+
+	count := 0
+
+	// Sync each hook to its desired command. Entire-owned entries carrying any
+	// other command are dropped first, even without --force: a hook written by
+	// an older version would otherwise survive alongside the one added below and
+	// keep firing, which for the removed local-dev mode means a script inside
+	// the working tree still runs on every agent turn.
+	staleDropped := false
+	for _, hookName := range c.HookNames() {
+		cmd := agent.WrapProductionSilentHookCommand(cmdPrefix + hookName)
+		entries := hookEntries[hookName]
+
+		// Keep the matching entry rather than remove-and-re-add: entry-level
+		// fields (cwd, timeoutSec, env) live on the existing entry and a freshly
+		// constructed one would discard them.
+		kept, dropped := agent.DropStaleManagedHooks(entries, hookEntryBash, []string{cmd})
+		if dropped {
+			staleDropped = true
+		}
+		entries = kept
+
+		if !hookBashExists(entries, cmd) {
+			entries = append(entries, CopilotHookEntry{
+				Type:    "command",
+				Bash:    cmd,
+				Comment: "Entire CLI",
+			})
+			count++
+		}
+		hookEntries[hookName] = entries
+	}
+
+	// staleDropped forces a write even when nothing was added: a file holding
+	// both a stale and a current hook adds nothing, and returning early here
+	// would leave the stale hook on disk.
+	if count == 0 && !staleDropped {
+		return 0, nil
+	}
+
+	// Marshal modified hook types back into rawHooks
+	for _, hookName := range c.HookNames() {
+		key := hookConfigKey[hookName]
+		if err := marshalCopilotHookType(rawHooks, key, hookEntries[hookName]); err != nil {
+			return 0, fmt.Errorf("failed to marshal %s hooks: %w", key, err)
+		}
+	}
+
+	// Marshal hooks and update raw file
+	hooksJSON, err := jsonutil.MarshalWithNoHTMLEscape(rawHooks)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal hooks: %w", err)
+	}
+	rawFile["hooks"] = hooksJSON
+
+	// Write to file
+	output, err := jsonutil.MarshalIndentWithNewline(rawFile, "", "  ")
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal %s: %w", HooksFileName, err)
+	}
+
+	if err := cfg.Write(output, 0o600); err != nil {
+		return 0, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	}
+
+	return count, nil
+}
+
+// UninstallHooks removes Entire hooks from Copilot CLI's entire.json.
+// Unknown top-level fields and hook types are preserved on round-trip.
+func (c *CopilotCLIAgent) UninstallHooks(ctx context.Context) error {
+	cfg, err := copilotHookConfig(ctx)
+	if err != nil {
+		return err
+	}
+	data, err := cfg.Read()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // No hooks file means nothing to uninstall
+		}
+		return fmt.Errorf("failed to read %s: %w", HooksFileName, err)
+	}
+
+	var rawFile map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFile); err != nil {
+		return fmt.Errorf("failed to parse %s: %w", HooksFileName, err)
+	}
+
+	var rawHooks map[string]json.RawMessage
+	if hooksRaw, ok := rawFile["hooks"]; ok {
+		if err := json.Unmarshal(hooksRaw, &rawHooks); err != nil {
+			return fmt.Errorf("failed to parse hooks in %s: %w", HooksFileName, err)
+		}
+	}
+	if rawHooks == nil {
+		rawHooks = make(map[string]json.RawMessage)
+	}
+
+	// Parse and remove Entire hooks from each hook type we manage
+	for _, hookName := range c.HookNames() {
+		key := hookConfigKey[hookName]
+		var entries []CopilotHookEntry
+		if err := parseCopilotHookType(rawHooks, key, &entries); err != nil {
+			return fmt.Errorf("failed to parse %s hooks: %w", key, err)
+		}
+		entries = removeEntireHooks(entries)
+		if err := marshalCopilotHookType(rawHooks, key, entries); err != nil {
+			return fmt.Errorf("failed to marshal %s hooks: %w", key, err)
+		}
+	}
+
+	// Marshal hooks back (preserving unknown hook types)
+	if len(rawHooks) > 0 {
+		hooksJSON, err := jsonutil.MarshalWithNoHTMLEscape(rawHooks)
+		if err != nil {
+			return fmt.Errorf("failed to marshal hooks: %w", err)
+		}
+		rawFile["hooks"] = hooksJSON
+	} else {
+		delete(rawFile, "hooks")
+	}
+
+	// Write back
+	output, err := jsonutil.MarshalIndentWithNewline(rawFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal %s: %w", HooksFileName, err)
+	}
+
+	if err := cfg.Write(output, 0o600); err != nil {
+		return err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	}
+	return nil
+}
+
+// AreHooksInstalled checks if Entire hooks are installed in the Copilot CLI
+// config.
+//
+// A missing config file is an answer — no hooks — while an unreadable or
+// malformed one is an error: "we could not tell" and "there are none" are
+// different things to a caller deciding whether hooks can be left alone.
+func (c *CopilotCLIAgent) AreHooksInstalled(ctx context.Context) (bool, error) {
+	cfg, err := copilotHookConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	data, err := cfg.Read()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		logging.Warn(ctx, "copilot-cli: failed to read hooks file", "path", cfg.Path(), "err", err)
+		return false, fmt.Errorf("read %s: %w", cfg.Path(), err)
+	}
+
+	var hooksFile CopilotHooksFile
+	if err := json.Unmarshal(data, &hooksFile); err != nil {
+		logging.Warn(ctx, "copilot-cli: failed to parse hooks file", "path", cfg.Path(), "err", err)
+		return false, fmt.Errorf("parse %s: %w", cfg.Path(), err)
+	}
+
+	return hasEntireHook(hooksFile.Hooks.UserPromptSubmitted) ||
+		hasEntireHook(hooksFile.Hooks.SessionStart) ||
+		hasEntireHook(hooksFile.Hooks.AgentStop) ||
+		hasEntireHook(hooksFile.Hooks.SessionEnd) ||
+		hasEntireHook(hooksFile.Hooks.SubagentStop) ||
+		hasEntireHook(hooksFile.Hooks.PreToolUse) ||
+		hasEntireHook(hooksFile.Hooks.PostToolUse) ||
+		hasEntireHook(hooksFile.Hooks.ErrorOccurred), nil
+}
+
+// GetSupportedHooks returns the normalized lifecycle events this agent supports.
+// Note: HookNames() returns 8 hooks but GetSupportedHooks() returns only 6.
+// The two not listed here are:
+//   - subagentStop: handled by ParseHookEvent (returns SubagentEnd), but there is no
+//     HookType constant for subagent events (they use EventType instead).
+//   - errorOccurred: pass-through hook with no lifecycle action (ParseHookEvent returns nil).
+func (c *CopilotCLIAgent) GetSupportedHooks() []agent.HookType {
+	return []agent.HookType{
+		agent.HookSessionStart,
+		agent.HookSessionEnd,
+		agent.HookUserPromptSubmit,
+		agent.HookStop,
+		agent.HookPreToolUse,
+		agent.HookPostToolUse,
+	}
+}
+
+// parseCopilotHookType parses a specific hook type from rawHooks into the target slice.
+func parseCopilotHookType(rawHooks map[string]json.RawMessage, hookType string, target *[]CopilotHookEntry) error {
+	if data, ok := rawHooks[hookType]; ok {
+		if err := json.Unmarshal(data, target); err != nil {
+			return fmt.Errorf("invalid JSON for hook type %s: %w", hookType, err)
+		}
+	}
+	return nil
+}
+
+// marshalCopilotHookType marshals a hook type back into rawHooks.
+// If the slice is empty, removes the key from rawHooks.
+func marshalCopilotHookType(rawHooks map[string]json.RawMessage, hookType string, entries []CopilotHookEntry) error {
+	if len(entries) == 0 {
+		delete(rawHooks, hookType)
+		return nil
+	}
+	data, err := jsonutil.MarshalWithNoHTMLEscape(entries)
+	if err != nil {
+		return fmt.Errorf("failed to marshal hook type %s: %w", hookType, err)
+	}
+	rawHooks[hookType] = data
+	return nil
+}
+
+// hookBashExists checks if a hook with the given bash command already exists.
+func hookBashExists(entries []CopilotHookEntry, bash string) bool {
+	for _, entry := range entries {
+		if entry.Bash == bash {
+			return true
+		}
+	}
+	return false
+}
+
+// isEntireHook checks if a hook entry's bash command belongs to Entire.
+// hookEntryBash reads the command off a hook entry for the shared helpers.
+// Copilot CLI stores it under `bash`, not `command`.
+func hookEntryBash(e CopilotHookEntry) string { return e.Bash }
+
+func isEntireHook(bash string) bool {
+	return agent.IsManagedHookCommand(bash)
+}
+
+// hasEntireHook checks if any entry in the slice is an Entire hook.
+func hasEntireHook(entries []CopilotHookEntry) bool {
+	for _, entry := range entries {
+		if isEntireHook(entry.Bash) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeEntireHooks removes all Entire hooks from the slice.
+func removeEntireHooks(entries []CopilotHookEntry) []CopilotHookEntry {
+	result := make([]CopilotHookEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !isEntireHook(entry.Bash) {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+// HookConfigRelPath implements agent.HookConfigLocator.
+func (c *CopilotCLIAgent) HookConfigRelPath() string { return hooksDir + "/" + HooksFileName }

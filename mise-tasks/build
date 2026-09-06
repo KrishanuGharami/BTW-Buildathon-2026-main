@@ -1,0 +1,7 @@
+#!/bin/sh
+#MISE description="Build the CLI"
+
+set -eu
+
+go build -o entire ./cmd/entire
+go build -o git-remote-entire ./cmd/git-remote-entire

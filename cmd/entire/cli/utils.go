@@ -1,0 +1,168 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"charm.land/huh/v2"
+
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/uiform"
+)
+
+// IsAccessibleMode returns true if accessibility mode is enabled via the
+// ACCESSIBLE environment variable.
+func IsAccessibleMode() bool {
+	return uiform.IsAccessibleMode()
+}
+
+// NewAccessibleForm creates a new huh form with Entire's standard theme,
+// switching to accessibility mode when ACCESSIBLE is set.
+func NewAccessibleForm(groups ...*huh.Group) *huh.Form {
+	return uiform.New(groups...)
+}
+
+// handleFormCancellation handles cancellation from huh form prompts.
+// User abort (Ctrl+C), timeout, and a cancelled/expired context (when the form
+// ran via RunWithContext and the command's context was cancelled) all print a
+// cancelled message and return nil. Other errors are wrapped with the action
+// name for context.
+func handleFormCancellation(w io.Writer, action string, err error) error {
+	if errors.Is(err, huh.ErrUserAborted) || errors.Is(err, huh.ErrTimeout) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		fmt.Fprintf(w, "%s cancelled.\n", action)
+		return nil
+	}
+	return fmt.Errorf("%s prompt failed: %w", action, err)
+}
+
+// printSessionCommand writes a single session resume command line to w.
+// It appends a "(most recent)" label to the last entry in a multi-session list,
+// and a "# prompt" comment when a prompt is available.
+func printSessionCommand(w io.Writer, resumeCmd, prompt string, isMulti, isLast bool) {
+	comment := ""
+	if isMulti && isLast {
+		if prompt != "" {
+			comment = fmt.Sprintf("  # %s (most recent)", prompt)
+		} else {
+			comment = "  # (most recent)"
+		}
+	} else if prompt != "" {
+		comment = "  # " + prompt
+	}
+	fmt.Fprintf(w, "  %s%s\n", resumeCmd, comment)
+}
+
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// copyFile copies a file from src to dst using os.Root for traversal-resistant
+// writes (Go 1.24+). dst must be absolute and reside under either the repo
+// worktree root, the user's home directory (for agent session dirs such as
+// ~/.claude/), or the system temp directory (used during tests).
+// The kernel enforces that the write cannot escape the allowed directory,
+// eliminating TOCTOU races and symlink escapes.
+func copyFile(src, dst string) error {
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
+
+	if !filepath.IsAbs(dst) {
+		return fmt.Errorf("copyFile: dst must be absolute, got %q", dst)
+	}
+
+	input, err := os.ReadFile(src)
+	if err != nil {
+		return err //nolint:wrapcheck // already present in codebase
+	}
+
+	root, relPath, err := openAllowedRoot(dst)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	if err := jsonutil.WriteFileAtomicIn(root, relPath, input, 0o600); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	return nil
+}
+
+// openAllowedRoot finds the allowed root directory that contains dst and returns
+// an os.Root handle along with the relative path within that root.
+//
+// The root's base is always one of three directories resolved independently of
+// dst — the worktree root, the user's home, the system temp dir — never
+// filepath.Dir(dst). dst only selects WHICH of them applies and supplies the
+// name inside it, so a dst that escapes every one of them is refused here rather
+// than opening a root wherever it points.
+// dst is resolved through symlinks before matching to handle macOS /var → /private/var.
+func openAllowedRoot(dst string) (*os.Root, string, error) {
+	allowed := allowedRootDirs()
+
+	// Resolve the directory portion of dst through symlinks so that e.g.
+	// /var/folders/... matches /private/var/folders/... on macOS.
+	// Only the parent directory is resolved; the final component may not exist yet.
+	resolvedDst := dst
+	if r, err := filepath.EvalSymlinks(filepath.Dir(dst)); err == nil {
+		resolvedDst = filepath.Join(r, filepath.Base(dst))
+	}
+
+	for _, dir := range allowed {
+		if !paths.IsSubpath(dir, resolvedDst) {
+			continue
+		}
+		rel, err := filepath.Rel(dir, resolvedDst)
+		if err != nil {
+			continue
+		}
+		// A PRIVATE root, deliberately not osroot.Shared. Two of the three
+		// candidate bases are the user's home and the system temp dir, which have
+		// no business sharing a lifecycle with .entire: ResetShared closes every
+		// cached root, so routing this through the registry let an unrelated
+		// `entire disable` — or, in tests, any parallel entiredir.Reset — close
+		// the handle out from under a copy in progress. The registry exists to
+		// memoize long-lived anchors, and this is a single write.
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return nil, "", fmt.Errorf("openAllowedRoot: failed to open root %q: %w", dir, err)
+		}
+		return root, filepath.ToSlash(rel), nil
+	}
+
+	return nil, "", fmt.Errorf("openAllowedRoot: dst %q is outside allowed directories", dst)
+}
+
+// allowedRootDirs returns the list of directories that copyFile may write to.
+// Directories are resolved through symlinks so they match resolved dst paths.
+func allowedRootDirs() []string {
+	allowed := make([]string, 0, 3)
+
+	if repoRoot, err := paths.WorktreeRoot(context.Background()); err == nil {
+		allowed = appendResolved(allowed, repoRoot)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		allowed = appendResolved(allowed, home)
+	}
+	if tmpDir := os.TempDir(); tmpDir != "" {
+		allowed = appendResolved(allowed, tmpDir)
+	}
+
+	return allowed
+}
+
+// appendResolved appends dir to the list after resolving symlinks.
+// Falls back to the original path if symlink resolution fails.
+func appendResolved(dirs []string, dir string) []string {
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return append(dirs, resolved)
+	}
+	return append(dirs, dir)
+}
